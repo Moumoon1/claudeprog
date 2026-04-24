@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>走查 - Design Pilot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+  <div class="header">
+    <a href="index.html" class="back-btn">&#8592; 返回首页</a>
+    <h1>走查</h1>
+  </div>
+
+  <div class="page">
+    <div class="page-desc">上传开发页面截图和设计稿长图，AI 自动对比两者差异，生成带截图标注的走查报告，帮助快速发现样式偏差和模块缺失。</div>
+
+    <!-- Tab 切换 -->
+    <div class="upload-tabs">
+      <div class="upload-tab active" data-tab="single" onclick="switchTab('single')">&#128247; 单页面上传</div>
+      <div class="upload-tab" data-tab="folder" onclick="switchTab('folder')">&#128194; 文件夹上传</div>
+    </div>
+
+    <!-- 单页面上传 -->
+    <div class="tab-content active" id="singleTab">
+      <div class="section">
+        <h3>&#128187; 开发截图 &nbsp;&#127912; 设计稿</h3>
+        <div class="upload-grid">
+          <div class="upload-box" id="devBox" onclick="document.getElementById('devFile').click()">
+            <input type="file" id="devFile" accept="image/*" onchange="handleImage(this, 'devBox', 'dev')">
+            <div class="upload-label">
+              <span>&#128187;</span>
+              开发长截图
+            </div>
+          </div>
+          <div class="upload-box" id="designBox" onclick="document.getElementById('designFile').click()">
+            <input type="file" id="designFile" accept="image/*" onchange="handleImage(this, 'designBox', 'design')">
+            <div class="upload-label">
+              <span>&#127912;</span>
+              设计稿长图
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 文件夹上传 -->
+    <div class="tab-content" id="folderTab">
+      <div class="naming-tip">
+        <strong>&#9888;&#65039; 命名规则提醒</strong>
+        <p>开发截图和设计稿必须使用<strong>相同的文件名</strong>才能自动配对对比。例如：</p>
+        <div class="naming-example">
+          <div class="naming-side">
+            <div class="naming-side-title">&#128187; 开发截图文件夹</div>
+            <div class="naming-file">首页.png</div>
+            <div class="naming-file">列表页.png</div>
+            <div class="naming-file">详情页.png</div>
+          </div>
+          <div class="naming-arrow">→ 自动配对 →</div>
+          <div class="naming-side">
+            <div class="naming-side-title">&#127912; 设计稿文件夹</div>
+            <div class="naming-file">首页.png</div>
+            <div class="naming-file">列表页.png</div>
+            <div class="naming-file">详情页.png</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>&#128187; 开发截图文件夹</h3>
+        <div class="folder-upload-box" id="devFolderBox" onclick="document.getElementById('devFolder').click()">
+          <input type="file" id="devFolder" webkitdirectory directory multiple onchange="handleFolder(this, 'dev')">
+          <div class="folder-label" id="devFolderLabel">
+            <span>&#128194;</span>
+            选择开发截图文件夹
+          </div>
+        </div>
+        <div class="file-list" id="devFileList"></div>
+      </div>
+
+      <div class="section">
+        <h3>&#127912; 设计稿文件夹</h3>
+        <div class="folder-upload-box" id="designFolderBox" onclick="document.getElementById('designFolder').click()">
+          <input type="file" id="designFolder" webkitdirectory directory multiple onchange="handleFolder(this, 'design')">
+          <div class="folder-label" id="designFolderLabel">
+            <span>&#128194;</span>
+            选择设计稿文件夹
+          </div>
+        </div>
+        <div class="file-list" id="designFileList"></div>
+      </div>
+
+      <div class="pair-status" id="pairStatus"></div>
+    </div>
+
+    <!-- 背景信息 -->
+    <div class="section">
+      <h3>&#128221; 背景信息（可选）</h3>
+      <textarea id="bgInfo" rows="3" placeholder="补充走查背景，例如：本次重点检查首页改版，关注顶部导航和底部 CTA 按钮的还原度..."></textarea>
+    </div>
+
+    <button class="submit-btn" id="submitBtn" onclick="startReview()">
+      <span class="spinner"></span>
+      <span class="btn-text">开始走查</span>
+    </button>
+
+    <div class="error-msg" id="errorMsg" style="display:none"></div>
+
+    <div class="loading-overlay" id="loadingOverlay">
+      <div class="loading-dots">
+        <div class="dot"></div>
+        <div class="dot"></div>
+        <div class="dot"></div>
+      </div>
+      <div class="loading-steps" id="loadingSteps">
+        <div class="loading-step" id="stepUpload">
+          <span class="step-indicator"></span>
+          <span>上传文件</span>
+        </div>
+        <div class="loading-step" id="stepAnalyze">
+          <span class="step-indicator"></span>
+          <span>Claude Code 分析中</span>
+        </div>
+        <div class="loading-step" id="stepDone">
+          <span class="step-indicator"></span>
+          <span>分析完成</span>
+        </div>
+      </div>
+      <div class="loading-text" id="loadingText">请稍候...</div>
+    </div>
+
+    <div class="result-area" id="resultArea">
+      <div class="section">
+        <h3>&#128203; 走查结果</h3>
+        <div class="result-actions" style="display:flex;gap:8px;margin-bottom:16px;justify-content:flex-end;">
+          <button class="copy-btn" onclick="copyResult()">&#128203; 复制结果</button>
+        </div>
+        <div class="result-content" id="resultContent"></div>
+      </div>
+    </div>
+  </div>
+
+  <style>
+    .copy-btn {
+      padding: 6px 14px;
+      border: 1px solid #e5e5e5;
+      border-radius: 8px;
+      background: #fff;
+      color: #666;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .copy-btn:hover {
+      border-color: #111;
+      color: #111;
+    }
+    .copy-btn.copied {
+      background: #111;
+      color: #fff;
+      border-color: #111;
+    }
+
+    /* Tabs */
+    .upload-tabs {
+      display: flex;
+      gap: 0;
+      margin-bottom: 20px;
+      background: #f0f0f0;
+      border-radius: 10px;
+      padding: 4px;
+    }
+    .upload-tab {
+      flex: 1;
+      text-align: center;
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      color: #666;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .upload-tab.active {
+      background: #fff;
+      color: #111;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    }
+    .tab-content {
+      display: none;
+    }
+    .tab-content.active {
+      display: block;
+    }
+
+    /* Naming tip */
+    .naming-tip {
+      background: #fffbeb;
+      border: 1px solid #fde68a;
+      border-radius: 10px;
+      padding: 14px 18px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      color: #92400e;
+      line-height: 1.6;
+    }
+    .naming-tip strong {
+      color: #78350f;
+    }
+    .naming-tip p {
+      margin: 4px 0 10px;
+    }
+    .naming-example {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: rgba(255,255,255,0.7);
+      border-radius: 8px;
+      padding: 12px 16px;
+    }
+    .naming-side {
+      flex: 1;
+    }
+    .naming-side-title {
+      font-weight: 600;
+      font-size: 12px;
+      margin-bottom: 6px;
+      color: #78350f;
+    }
+    .naming-file {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 12px;
+      padding: 2px 8px;
+      background: rgba(0,0,0,0.04);
+      border-radius: 4px;
+      margin-bottom: 3px;
+      display: inline-block;
+    }
+    .naming-arrow {
+      font-size: 12px;
+      color: #92400e;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    /* Folder upload */
+    .folder-upload-box {
+      border: 2px dashed #d4d4d4;
+      border-radius: 10px;
+      padding: 28px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      position: relative;
+      min-height: 120px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: #fafafa;
+    }
+    .folder-upload-box:hover {
+      border-color: #111;
+      background: #f5f5f5;
+    }
+    .folder-upload-box.has-files {
+      border-style: solid;
+      border-color: #e0e0e0;
+      background: #fff;
+    }
+    .folder-upload-box input[type="file"] {
+      display: none;
+    }
+    .folder-label {
+      color: #999;
+      font-size: 14px;
+    }
+    .folder-label span {
+      display: block;
+      font-size: 32px;
+      margin-bottom: 8px;
+    }
+
+    /* File list */
+    .file-list {
+      margin-top: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .file-tag {
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 100px;
+      background: #f0f0f0;
+      color: #555;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .file-tag .remove-file {
+      cursor: pointer;
+      color: #999;
+      font-size: 13px;
+      line-height: 1;
+    }
+    .file-tag .remove-file:hover {
+      color: #e53e3e;
+    }
+
+    /* Pair status */
+    .pair-status {
+      margin-top: 12px;
+      padding: 12px 16px;
+      border-radius: 10px;
+      background: #f0fdf4;
+      border: 1px solid #bbf7d0;
+      font-size: 13px;
+      color: #166534;
+      display: none;
+    }
+    .pair-status.has-pairs {
+      display: block;
+    }
+    .pair-status.has-unpaired {
+      background: #fef3c7;
+      border-color: #fde68a;
+      color: #92400e;
+    }
+    .pair-title {
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .pair-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .pair-tag {
+      font-size: 12px;
+      padding: 3px 10px;
+      border-radius: 100px;
+      background: rgba(255,255,255,0.7);
+      display: inline-block;
+    }
+    .pair-tag.unpaired {
+      background: rgba(251,191,36,0.2);
+      color: #92400e;
+    }
+
+    @media (max-width: 640px) {
+      .naming-example {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .naming-arrow {
+        text-align: center;
+        padding: 4px 0;
+      }
+    }
+  </style>
+
+  <script>
+    const images = { dev: null, design: null };
+    let resultMarkdown = '';
+
+    // Tab state
+    let currentTab = 'single';
+    const folderFiles = { dev: [], design: [] };
+
+    function switchTab(tab) {
+      currentTab = tab;
+      document.querySelectorAll('.upload-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === tab + 'Tab'));
+    }
+
+    // Single page upload
+    function handleImage(input, boxId, key) {
+      const file = input.files[0];
+      if (!file) return;
+      const box = document.getElementById(boxId);
+
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        images[key] = { file, data: e.target.result };
+        box.classList.add('has-image');
+        box.innerHTML = `<img src="${e.target.result}"><button class="remove-btn" onclick="removeImage(event, '${key}', '${boxId}')">&times;</button>`;
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function removeImage(e, key, boxId) {
+      e.stopPropagation();
+      images[key] = null;
+      const box = document.getElementById(boxId);
+      box.classList.remove('has-image');
+      const icon = key === 'dev' ? '&#128187;' : '&#127912;';
+      const label = key === 'dev' ? '开发长截图' : '设计稿长图';
+      box.innerHTML = `<input type="file" id="${key === 'dev' ? 'devFile' : 'designFile'}" accept="image/*" onchange="handleImage(this, '${boxId}', '${key}')"><div class="upload-label"><span>${icon}</span>${label}</div>`;
+    }
+
+    // Folder upload
+    function handleFolder(input, key) {
+      const files = Array.from(input.files).filter(f => /\.(png|jpg|jpeg|gif|webp|bmp)$/i.test(f));
+      if (files.length === 0) return;
+
+      folderFiles[key] = files;
+      const box = document.getElementById(key === 'dev' ? 'devFolderBox' : 'designFolderBox');
+      const label = document.getElementById(key === 'dev' ? 'devFolderLabel' : 'designFolderLabel');
+      const listEl = document.getElementById(key === 'dev' ? 'devFileList' : 'designFileList');
+
+      box.classList.add('has-files');
+      label.innerHTML = `<span>&#128194;</span>已选择 ${files.length} 张图片`;
+
+      listEl.innerHTML = files.map((f, i) =>
+        `<span class="file-tag">${f.name}<span class="remove-file" onclick="removeFolderFile(event, '${key}', ${i})">&times;</span></span>`
+      ).join('');
+
+      updatePairStatus();
+    }
+
+    function removeFolderFile(e, key, index) {
+      e.stopPropagation();
+      folderFiles[key].splice(index, 1);
+      const listEl = document.getElementById(key === 'dev' ? 'devFileList' : 'designFileList');
+      listEl.innerHTML = folderFiles[key].map((f, i) =>
+        `<span class="file-tag">${f.name}<span class="remove-file" onclick="removeFolderFile(event, '${key}', ${i})">&times;</span></span>`
+      ).join('');
+
+      if (folderFiles[key].length === 0) {
+        const box = document.getElementById(key === 'dev' ? 'devFolderBox' : 'designFolderBox');
+        const label = document.getElementById(key === 'dev' ? 'devFolderLabel' : 'designFolderLabel');
+        box.classList.remove('has-files');
+        const txt = key === 'dev' ? '选择开发截图文件夹' : '选择设计稿文件夹';
+        label.innerHTML = `<span>&#128194;</span>${txt}`;
+      }
+
+      updatePairStatus();
+    }
+
+    function updatePairStatus() {
+      const devNames = new Set(folderFiles.dev.map(f => f.name));
+      const designNames = new Set(folderFiles.design.map(f => f.name));
+
+      const paired = [];
+      const unpairedDev = [];
+      const unpairedDesign = [];
+
+      for (const name of devNames) {
+        if (designNames.has(name)) paired.push(name);
+        else unpairedDev.push(name);
+      }
+      for (const name of designNames) {
+        if (!devNames.has(name)) unpairedDesign.push(name);
+      }
+
+      const el = document.getElementById('pairStatus');
+      if (paired.length === 0 && unpairedDev.length === 0 && unpairedDesign.length === 0) {
+        el.classList.remove('has-pairs', 'has-unpaired');
+        el.style.display = 'none';
+        return;
+      }
+
+      el.style.display = 'block';
+      el.classList.add('has-pairs');
+      if (unpairedDev.length > 0 || unpairedDesign.length > 0) el.classList.add('has-unpaired');
+      else el.classList.remove('has-unpaired');
+
+      let html = '';
+      if (paired.length > 0) {
+        html += `<div class="pair-title">&#9989; 已配对 ${paired.length} 组页面</div>`;
+        html += `<div class="pair-tags">${paired.map(n => `<span class="pair-tag">${n.replace(/\.[^.]+$/, '')}</span>`).join('')}</div>`;
+      }
+      if (unpairedDev.length > 0) {
+        html += `<div class="pair-title" style="margin-top:8px">&#9888;&#65039; 开发侧未配对</div>`;
+        html += `<div class="pair-tags">${unpairedDev.map(n => `<span class="pair-tag unpaired">${n}</span>`).join('')}</div>`;
+      }
+      if (unpairedDesign.length > 0) {
+        html += `<div class="pair-title" style="margin-top:8px">&#9888;&#65039; 设计侧未配对</div>`;
+        html += `<div class="pair-tags">${unpairedDesign.map(n => `<span class="pair-tag unpaired">${n}</span>`).join('')}</div>`;
+      }
+      el.innerHTML = html;
+    }
+
+    // Loading helpers
+    function setLoading(show, step) {
+      const overlay = document.getElementById('loadingOverlay');
+      if (show) {
+        overlay.classList.add('active');
+        if (step) {
+          document.querySelectorAll('.loading-step').forEach(s => s.classList.remove('active'));
+          document.getElementById(step).classList.add('active');
+        }
+      } else {
+        overlay.classList.remove('active');
+      }
+    }
+
+    function setStepDone(step) {
+      document.getElementById(step).classList.remove('active');
+      document.getElementById(step).classList.add('done');
+    }
+
+    function setLoadingText(text) {
+      document.getElementById('loadingText').textContent = text;
+    }
+
+    // Zoom
+    window._zoom = function(idx) {
+      const src = window._zoomImages[idx];
+      if (!src) return;
+      const overlay = document.createElement('div');
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:10000;display:flex;align-items:center;justify-content:center;cursor:zoom-out';
+      overlay.onclick = function() { document.body.removeChild(overlay); document.body.removeChild(closeBtn); };
+      const img = document.createElement('img');
+      img.src = src;
+      img.style.cssText = 'max-width:95vw;max-height:95vh;object-fit:contain;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.5)';
+      img.onclick = function(e) { e.stopPropagation(); };
+      const closeBtn = document.createElement('div');
+      closeBtn.innerHTML = '&times;';
+      closeBtn.style.cssText = 'position:fixed;top:16px;right:20px;color:#fff;font-size:28px;width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,0.15);border-radius:50%;cursor:pointer;z-index:10001';
+      closeBtn.onclick = function(e) { e.stopPropagation(); document.body.removeChild(overlay); document.body.removeChild(closeBtn); };
+      overlay.appendChild(img);
+      document.body.appendChild(overlay);
+      document.body.appendChild(closeBtn);
+    };
+
+    // Copy result
+    function copyResult() {
+      if (!resultMarkdown) return;
+      navigator.clipboard.writeText(resultMarkdown).then(() => {
+        const btn = document.querySelector('.copy-btn');
+        btn.textContent = '✓ 已复制';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = '📋 复制结果';
+          btn.classList.remove('copied');
+        }, 2000);
+      });
+    }
+
+    // Submit
+    async function startReview() {
+      const bgInfo = document.getElementById('bgInfo').value.trim();
+
+      if (currentTab === 'single') {
+        if (!images.dev || !images.design) return alert('请上传两张截图');
+      } else {
+        if (folderFiles.dev.length === 0) return alert('请选择开发截图文件夹');
+        if (folderFiles.design.length === 0) return alert('请选择设计稿文件夹');
+        const devNames = folderFiles.dev.map(f => f.name);
+        const designNames = folderFiles.design.map(f => f.name);
+        const paired = devNames.filter(n => designNames.includes(n));
+        if (paired.length === 0) return alert('没有同名配对的页面，请确保开发截图和设计稿使用相同文件名');
+      }
+
+      const btn = document.getElementById('submitBtn');
+      const errorMsg = document.getElementById('errorMsg');
+      const resultArea = document.getElementById('resultArea');
+      const resultContent = document.getElementById('resultContent');
+
+      btn.classList.add('loading');
+      btn.disabled = true;
+      errorMsg.style.display = 'none';
+      resultArea.classList.remove('visible');
+      resultContent.innerHTML = '';
+      resultMarkdown = '';
+
+      document.querySelectorAll('.loading-step').forEach(s => {
+        s.classList.remove('active', 'done');
+      });
+
+      try {
+        setLoading(true, 'stepUpload');
+        setLoadingText('上传截图中...');
+
+        const formData = new FormData();
+        if (bgInfo) formData.append('files', new Blob([bgInfo], { type: 'text/plain' }), 'background.txt');
+        formData.append('bgInfo', bgInfo);
+        formData.append('mode', currentTab);
+
+        if (currentTab === 'single') {
+          formData.append('files', images.dev.file, 'dev_screenshot.png');
+          formData.append('files', images.design.file, 'design_mockup.png');
+        } else {
+          for (const f of folderFiles.dev) {
+            formData.append('files', f, 'dev_' + f.name);
+          }
+          for (const f of folderFiles.design) {
+            formData.append('files', f, 'design_' + f.name);
+          }
+        }
+
+        const uploadRes = await fetch('/api/upload/uicheck', {
+          method: 'POST',
+          body: formData
+        });
+
+        setStepDone('stepUpload');
+        if (!uploadRes.ok) throw new Error('上传失败');
+
+        setLoading(true, 'stepAnalyze');
+        setLoadingText('Claude Code 启动中...');
+        resultArea.classList.add('visible');
+        const eventSource = new EventSource('/api/analyze/uicheck');
+
+        eventSource.onmessage = (e) => {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'status') {
+            resultContent.innerHTML = `<p style="color:#6366f1">${msg.content}</p>`;
+            setLoadingText(msg.content);
+          } else if (msg.type === 'chunk') {
+            resultMarkdown += msg.content;
+            const overviewEnd = resultMarkdown.indexOf('## 问题表格');
+            const displayText = overviewEnd > 0 ? resultMarkdown.substring(0, overviewEnd) : resultMarkdown;
+            resultContent.innerHTML = marked.parse(displayText);
+            if (resultMarkdown.length > 20) {
+              setLoading(false);
+              setStepDone('stepAnalyze');
+            }
+          } else if (msg.type === 'table') {
+            renderIssueTable(msg.rows);
+          } else if (msg.type === 'error') {
+            errorMsg.textContent = msg.content;
+            errorMsg.style.display = 'block';
+            setLoading(false);
+            eventSource.close();
+          } else if (msg.type === 'done') {
+            setStepDone('stepAnalyze');
+            setStepDone('stepDone');
+            setLoadingText('分析完成');
+            setTimeout(() => setLoading(false), 600);
+            eventSource.close();
+          }
+        };
+
+        function renderIssueTable(rows) {
+          if (!rows || rows.length === 0) return;
+          const severityColors = { high: '#ef4444', medium: '#f59e0b', low: '#3b82f6' };
+          const severityLabels = { high: '严重', medium: '中等', low: '轻微' };
+
+          let html = '<div class="issue-table-wrapper"><table class="issue-table">';
+          html += '<thead><tr><th style="width:25%">问题点</th><th style="width:37.5%">开发页截图</th><th style="width:37.5%">设计页截图</th></tr></thead>';
+          html += '<tbody>';
+
+          const zoomImages = [];
+          rows.forEach((row, i) => {
+            const color = severityColors[row.severity] || severityColors.medium;
+            html += `<tr>`;
+            html += `<td>`;
+            html += `<div class="issue-severity" style="background:${color}">${severityLabels[row.severity]}</div>`;
+            html += `<div class="issue-location">${row.location}</div>`;
+            html += `<div class="issue-title">${row.issue}</div>`;
+            html += `<div class="issue-desc">${marked.parse(row.description)}</div>`;
+            html += `<div class="issue-suggestion">💡 ${marked.parse(row.suggestion)}</div>`;
+            html += `</td>`;
+            if (row.devImg) {
+              const idx = zoomImages.length;
+              zoomImages.push(row.devImg);
+              html += `<td class="issue-img-cell"><img src="${row.devImg}" class="zoomable" onclick="window._zoom(${idx})" alt="开发页"><div class="img-hint">点击查看大图</div></td>`;
+            } else {
+              html += `<td class="issue-img-cell"><div class="no-img">未截取到区域</div></td>`;
+            }
+            if (row.designImg) {
+              const idx = zoomImages.length;
+              zoomImages.push(row.designImg);
+              html += `<td class="issue-img-cell"><img src="${row.designImg}" class="zoomable" onclick="window._zoom(${idx})" alt="设计页"><div class="img-hint">点击查看大图</div></td>`;
+            } else {
+              html += `<td class="issue-img-cell"><div class="no-img">未截取到区域</div></td>`;
+            }
+            html += `</tr>`;
+          });
+
+          window._zoomImages = zoomImages;
+          html += '</tbody></table></div>';
+          resultContent.innerHTML += html;
+        }
+
+        eventSource.onerror = (e) => {
+          eventSource.close();
+        };
+      } catch (e) {
+        setLoading(false);
+        errorMsg.textContent = '请求失败: ' + e.message;
+        errorMsg.style.display = 'block';
+      } finally {
+        btn.classList.remove('loading');
+        btn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "name": "designer-platform",
+  "version": "1.0.0",
+  "description": "设计师平台 - Claude Code 驱动",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "multer": "^1.4.5-lts.1",
+    "sharp": "^0.33.5"
+  }
+}

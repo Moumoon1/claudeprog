@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>AIGC内容激励</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue', sans-serif;
+      background: #0a1616;
+      color: #fff;
+      min-height: 100vh;
+    }
+
+    .page {
+      max-width: 414px;
+      margin: 0 auto;
+      min-height: 100vh;
+      position: relative;
+      overflow-x: hidden;
+    }
+
+    /* 背景图 */
+    .bg-image {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 517px;
+      z-index: 0;
+    }
+
+    .bg-image img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .bg-gradient {
+      position: absolute;
+      top: 440px;
+      left: 0;
+      width: 100%;
+      height: 101px;
+      background: linear-gradient(to bottom, rgba(10,22,22,0) 0%, #0a1616 100%);
+      z-index: 1;
+    }
+
+    /* 状态栏 */
+    .status-bar {
+      position: relative;
+      z-index: 10;
+      height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 14px;
+    }
+
+    .time {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.3px;
+    }
+
+    .status-icons {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .status-icons span {
+      font-size: 12px;
+    }
+
+    /* 头部 */
+    .header {
+      position: relative;
+      z-index: 10;
+      padding: 10px 11px;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .back-btn {
+      width: 40px;
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(234, 232, 192, 0.1);
+      border-radius: 50%;
+    }
+
+    .back-btn::before {
+      content: '‹';
+      font-size: 28px;
+      color: #eae8c0;
+    }
+
+    .header-right {
+      display: flex;
+      gap: 8px;
+    }
+
+    .header-btn {
+      width: 40px;
+      height: 40px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: rgba(234, 232, 192, 0.1);
+      border-radius: 50%;
+      font-size: 10px;
+      color: #eae8c0;
+    }
+
+    /* 主体内容 */
+    .main-content {
+      position: relative;
+      z-index: 10;
+      padding: 0 16px;
+      text-align: center;
+    }
+
+    .logo {
+      width: 150px;
+      height: 17.7px;
+      margin: 0 auto 12px;
+      background: linear-gradient(135deg, #3b997b, #5bc4a8);
+      border-radius: 4px;
+    }
+
+    .title {
+      font-size: 32px;
+      font-weight: bold;
+      margin-bottom: 16px;
+      color: #fffbe4;
+      text-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    }
+
+    /* 倒计时区 */
+    .countdown-section {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .countdown-box {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(59, 153, 123, 0.8);
+      padding: 4px 8px;
+      border-radius: 6px;
+    }
+
+    .countdown-item {
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .countdown-sep {
+      font-size: 13px;
+    }
+
+    .cycle-info {
+      font-size: 13px;
+      color: rgba(255,255,255,0.8);
+      writing-mode: vertical-rl;
+      letter-spacing: 2px;
+    }
+
+    .cycle-label {
+      font-weight: 500;
+    }
+
+    /* 分隔线 */
+    .divider {
+      height: 1px;
+      background: linear-gradient(to right, transparent, #fffbe4, transparent);
+      margin: 20px 0;
+    }
+
+    /* 收益卡片 */
+    .income-card {
+      background: linear-gradient(135deg, #1a2a2a, #0d1a1a);
+      border: 1px solid rgba(123, 170, 161, 0.3);
+      border-radius: 16px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+
+    .income-title {
+      font-size: 14px;
+      color: #fffbe4;
+      margin-bottom: 8px;
+    }
+
+    .income-value {
+      font-size: 28px;
+      font-weight: bold;
+      color: #ffcc00;
+    }
+
+    .income-unit {
+      font-size: 14px;
+      color: rgba(255,204,0,0.8);
+      margin-left: 4px;
+    }
+
+    /* 活动介绍 */
+    .activity-tabs {
+      display: flex;
+      justify-content: center;
+      gap: 40px;
+      margin: 24px 0 12px;
+    }
+
+    .tab {
+      font-size: 16px;
+      color: rgba(255,255,255,0.6);
+      padding-bottom: 8px;
+      border-bottom: 2px solid transparent;
+    }
+
+    .tab.active {
+      color: #fff;
+      border-bottom-color: #3b997b;
+    }
+
+    .activity-desc {
+      font-size: 13px;
+      color: rgba(255,255,255,0.7);
+      margin-bottom: 20px;
+    }
+
+    /* 按钮组 */
+    .btn-group {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 20px;
+    }
+
+    .btn {
+      flex: 1;
+      height: 42px;
+      border-radius: 8px;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #3b997b, #2d7a63);
+      color: #fff;
+      border: none;
+    }
+
+    .btn-secondary {
+      background: rgba(255,255,255,0.1);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+
+    /* 视频课程区 */
+    .course-section {
+      background: rgba(255,255,255,0.03);
+      border-radius: 16px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+
+    .course-tip {
+      background: rgba(59, 153, 123, 0.15);
+      border: 1px solid rgba(59, 153, 123, 0.3);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 16px;
+      text-align: left;
+    }
+
+    .course-tip-title {
+      font-size: 13px;
+      color: #5bc4a8;
+      margin-bottom: 4px;
+    }
+
+    .course-tip-desc {
+      font-size: 12px;
+      color: rgba(255,255,255,0.6);
+    }
+
+    .section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+
+    .section-title h3 {
+      font-size: 16px;
+      color: #fff;
+    }
+
+    .lottery-count {
+      font-size: 13px;
+      color: #3b997b;
+    }
+
+    .video-list {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 10px;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .video-card {
+      flex-shrink: 0;
+      width: 112px;
+      background: rgba(255,255,255,0.05);
+      border-radius: 12px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .video-cover {
+      width: 100%;
+      height: 149px;
+      background: linear-gradient(135deg, #2a3a3a, #1a2525);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 32px;
+      color: rgba(255,255,255,0.3);
+    }
+
+    .video-title {
+      font-size: 13px;
+      color: #fff;
+      padding: 8px;
+      text-align: left;
+    }
+
+    /* 奖励状态标签 */
+    .reward-tag {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      display: flex;
+      align-items: center;
+      gap: 3px;
+    }
+
+    .reward-tag.claimed {
+      background: rgba(59, 153, 123, 0.8);
+      color: #fff;
+    }
+
+    .reward-tag.pending {
+      background: rgba(255, 204, 0, 0.8);
+      color: #fff;
+    }
+
+    .reward-tag.unclaimed {
+      background: rgba(255, 255, 255, 0.2);
+      color: rgba(255,255,255,0.8);
+    }
+
+    .video-info {
+      padding: 8px;
+    }
+
+    .video-name {
+      font-size: 13px;
+      color: #fff;
+      margin-bottom: 4px;
+    }
+
+    .video-status {
+      font-size: 11px;
+      color: rgba(255,255,255,0.5);
+    }
+
+    .video-status.done {
+      color: #5bc4a8;
+    }
+
+    /* 话题区 */
+    .topic-section {
+      margin-top: 24px;
+      padding: 16px;
+      background: rgba(255,255,255,0.05);
+      border-radius: 12px;
+    }
+
+    .topic-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+
+    .topic-title {
+      font-size: 14px;
+      color: #fff;
+    }
+
+    .topic-more {
+      font-size: 12px;
+      color: rgba(255,255,255,0.5);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .topic-tag {
+      display: inline-block;
+      padding: 6px 12px;
+      background: rgba(59, 153, 123, 0.3);
+      border-radius: 16px;
+      font-size: 13px;
+      color: #5bc4a8;
+    }
+
+    /* 底部 */
+    .footer {
+      height: 80px;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <!-- 背景 -->
+    <div class="bg-image">
+      <img src="https://www.figma.com/api/mcp/asset/e52149ec-f81e-4e35-880d-a22550d172a1" alt="">
+    </div>
+    <div class="bg-gradient"></div>
+
+    <!-- 状态栏 -->
+    <div class="status-bar">
+      <span class="time">12:08</span>
+      <div class="status-icons">
+        <span>📶</span>
+        <span>📡</span>
+        <span>🔋</span>
+      </div>
+    </div>
+
+    <!-- 头部 -->
+    <div class="header">
+      <div class="back-btn"></div>
+      <div class="header-right">
+        <div class="header-btn">规则</div>
+        <div class="header-btn">钱包</div>
+      </div>
+    </div>
+
+    <!-- 主体内容 -->
+    <div class="main-content">
+      <!-- Logo -->
+      <div class="logo"></div>
+
+      <!-- 标题 -->
+      <h1 class="title">AIGC内容激励</h1>
+
+      <!-- 倒计时 -->
+      <div class="countdown-section">
+        <div style="display:flex;align-items:center;gap:4px;">
+          <span style="font-size:13px;color:rgba(255,255,255,0.8);">本期剩余</span>
+          <div class="countdown-box">
+            <span class="countdown-item">02</span>
+            <span class="countdown-sep">:</span>
+            <span class="countdown-item">24</span>
+            <span class="countdown-sep">:</span>
+            <span class="countdown-item">35</span>
+          </div>
+        </div>
+        <div class="cycle-info">
+          <span class="cycle-label">周期</span> 5.12-5.19
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- 收益卡片 -->
+      <div class="income-card">
+        <div class="income-title">预估收益</div>
+        <div>
+          <span class="income-value">888.88</span>
+          <span class="income-unit">元</span>
+        </div>
+      </div>
+
+      <!-- 活动介绍 -->
+      <div class="activity-tabs">
+        <span class="tab active">活动介绍</span>
+        <span class="tab">活动规则</span>
+      </div>
+      <p class="activity-desc">经平台审核通过即可参与快成长计划</p>
+
+      <!-- 按钮 -->
+      <div class="btn-group">
+        <div class="btn btn-primary">立即参与</div>
+        <div class="btn btn-secondary">了解更多</div>
+      </div>
+
+      <!-- 视频课程 -->
+      <div class="course-section">
+        <div class="course-tip">
+          <div class="course-tip-title">每日学习福利</div>
+          <div class="course-tip-desc">每日首次观看课程可领取1次抽奖机会，次日重置</div>
+        </div>
+        <div class="section-title">
+          <h3>涨粉必修课</h3>
+          <span class="lottery-count">剩余抽奖机会：1</span>
+        </div>
+        <div class="video-list">
+          <div class="video-card">
+            <div class="reward-tag claimed">✓ 已领取</div>
+            <div class="video-cover">▶</div>
+            <div class="video-info">
+              <div class="video-name">涨粉初级课1</div>
+              <div class="video-status done">✓ 已看完</div>
+            </div>
+          </div>
+          <div class="video-card">
+            <div class="reward-tag pending">⏳ 待领取</div>
+            <div class="video-cover">▶</div>
+            <div class="video-info">
+              <div class="video-name">涨粉初级课2</div>
+              <div class="video-status done">✓ 已看完</div>
+            </div>
+          </div>
+          <div class="video-card">
+            <div class="reward-tag unclaimed">○ 可观看</div>
+            <div class="video-cover">▶</div>
+            <div class="video-info">
+              <div class="video-name">涨粉初级课3</div>
+              <div class="video-status">○ 待观看</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 话题 -->
+      <div class="topic-section">
+        <div class="topic-header">
+          <span class="topic-title">热门话题</span>
+          <span class="topic-more">更多 ›</span>
+        </div>
+        <span class="topic-tag">#新年讨红包姿势#</span>
+      </div>
+
+      <div class="footer"></div>
+    </div>
+  </div>
+</body>
+</html>

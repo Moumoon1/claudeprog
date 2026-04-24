@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -L -o /Users/jinhui/Desktop/claudeprog/user_test_page2.jpeg \"https://minimax-algeng-chat-tts.oss-cn-wulanchabu.aliyuncs.com/ccv2%2F2026-04-20%2FMiniMax-M2.7%2F2038812091439128743%2F4d4cb7522a89f1bc98a37f6e04f9ead220cc07b7b9dac492dd6792c67651fd1c..jpeg?Expires=1776745386&OSSAccessKeyId=LTAI5tGLnRTkBjLuYPjNcKQ8&Signature=4DZlJS2LkHxwd65kUIj0x6WB6Xs%3D\")",
+      "Bash(python3 -m http.server 8080)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8080/designer-platform/index.html)",
+      "Bash(curl -s http://localhost:8080/designer-platform/index.html)",
+      "Bash(npx claude *)",
+      "Bash(node -e \"try{require.resolve\\('express'\\);console.log\\('express available'\\)}catch\\(e\\){console.log\\('express not available'\\)}\")"
+    ]
+  }
+}
