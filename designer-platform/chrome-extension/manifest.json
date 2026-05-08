@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Design Pilot - PRD Content Fetcher",
+  "version": "1.0",
+  "description": "Extract PRD content from internal docs using logged-in browser session",
+  "permissions": ["tabs", "scripting", "activeTab", "cookies"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Design Pilot PRD Fetcher"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

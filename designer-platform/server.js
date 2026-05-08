@@ -10,11 +10,9 @@ const PORT = 3000;
 const PROJECT_DIR = path.resolve(__dirname);
 const INPUTS_DIR = path.join(PROJECT_DIR, 'inputs');
 const PARENT_DIR = path.resolve(PROJECT_DIR, '..');
-const CROP_DIR = path.join(INPUTS_DIR, '_crops');
 
 // Ensure directories exist
 fs.mkdirSync(INPUTS_DIR, { recursive: true });
-fs.mkdirSync(CROP_DIR, { recursive: true });
 
 // Each upload type gets its own sub-directory to prevent cross-contamination
 function getInputsDir(type) {
@@ -23,112 +21,121 @@ function getInputsDir(type) {
   return dir;
 }
 
-// Clean crop directory before each analysis
-function cleanCrops() {
-  if (!fs.existsSync(CROP_DIR)) return;
-  const files = fs.readdirSync(CROP_DIR);
-  for (const f of files) fs.unlinkSync(path.join(CROP_DIR, f));
-}
-
-// Parse region marker into crop ratios (y ratio, height ratio) of image height
-function parseRegionMarker(marker) {
-  const m = marker.toLowerCase().trim();
-  // Exact marker matching for reliability
-  switch (m) {
-    case 'top':       return { y: 0.0,  h: 0.20 };  // 顶部20%
-    case 'mid':       return { y: 0.25, h: 0.50 };  // 中部50%
-    case 'midtop':    return { y: 0.0,  h: 0.45 };  // 中上部45%
-    case 'midbottom': return { y: 0.40, h: 0.45 };  // 中下部45%
-    case 'bottom':    return { y: 0.75, h: 0.25 };  // 底部25%
-    case 'header':    return { y: 0.0,  h: 0.15 };  // 表头/导航15%
-    case 'tab':       return { y: 0.0,  h: 0.12 };  // 标签区12%
-    case 'footer':    return { y: 0.80, h: 0.20 };  // 页脚/操作区20%
-    default:
-      // Fallback: try to extract known keywords
-      if (/顶部|top/.test(m)) return { y: 0.0, h: 0.20 };
-      if (/底部|bottom|footer/.test(m)) return { y: 0.75, h: 0.25 };
-      if (/中下/.test(m)) return { y: 0.40, h: 0.45 };
-      if (/中上/.test(m)) return { y: 0.0, h: 0.45 };
-      if (/中部|mid/.test(m)) return { y: 0.25, h: 0.50 };
-      if (/表头|header/.test(m)) return { y: 0.0, h: 0.15 };
-      if (/标签|tab/.test(m)) return { y: 0.0, h: 0.12 };
-      // Default: middle of the image
-      return { y: 0.25, h: 0.50 };
-  }
-}
-
-// Crop image region and return data URL
-async function cropRegion(imgPath, regionMarker, imgHeight) {
-  if (!fs.existsSync(imgPath)) return null;
-  const { y, h } = parseRegionMarker(regionMarker);
-  const meta = await sharp(imgPath).metadata();
-
-  if (meta.width <= 0 || meta.height <= 0) return null;
-
-  // Convert ratios to pixel coordinates
-  let cropY = Math.round(y * meta.height);
-  let cropH = Math.round(h * meta.height);
-
-  // Ensure cropH is at least 10% of image height and fits within bounds
-  const minH = Math.round(meta.height * 0.1);
-  cropH = Math.max(minH, cropH);
-  cropH = Math.min(cropH, meta.height - cropY);
-  cropY = Math.max(0, Math.min(cropY, meta.height - cropH));
-
-  console.log(`[cropRegion] marker="${regionMarker}" => y=${cropY} h=${cropH} (image ${meta.width}x${meta.height})`);
-
-  return sharp(imgPath)
-    .extract({ left: 0, top: cropY, width: meta.width, height: cropH })
-    // Keep original width (don't downscale), only limit max height for lightbox
-    .resize({ height: 3000, fit: 'inside' })
-    .png()
-    .toBuffer()
-    .then(buf => 'data:image/png;base64,' + buf.toString('base64'))
-    .catch(err => {
-      console.log(`[cropRegion] error for "${regionMarker}":`, err.message);
-      return null;
-    });
-}
-
-// Parse JSON array from Claude's text output
+// Parse JSON from Claude's text output
 function parseIssuesFromOutput(text) {
+  // Try code block first
   const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/);
   if (jsonMatch) {
-    try { return JSON.parse(jsonMatch[1]); } catch {}
+    try {
+      const parsed = JSON.parse(jsonMatch[1]);
+      if (parsed && (parsed.confirmed || parsed.suspected)) return parsed;
+    } catch {}
   }
+  // Try bare JSON object with confirmed/suspected keys
+  const objMatch = text.match(/\{[\s\S]*"confirmed"[\s\S]*\}/);
+  if (objMatch) {
+    try {
+      const parsed = JSON.parse(objMatch[0]);
+      if (parsed && (parsed.confirmed || parsed.suspected)) return parsed;
+    } catch {}
+  }
+  // Fallback: flat array (legacy format)
   const arrMatch = text.match(/\[[\s\S]*"issue"[\s\S]*\]/);
   if (arrMatch) {
-    try { return JSON.parse(arrMatch[0]); } catch {}
+    try { return { confirmed: JSON.parse(arrMatch[0]), suspected: [] }; } catch {}
   }
   return null;
 }
 
 // Convert dev_y (0-100 percentage) to crop parameters (y ratio, height ratio)
-// Centers a 20% crop window around the given position
-function devYToCrop(devY) {
+function devYToCrop(devY, cropPercent) {
   const y = Math.max(0, Math.min(100, devY || 50));
-  const halfH = 12; // crop window is ~24% of image height
+  const halfH = cropPercent || 12;
   const cropY = Math.max(0, y - halfH);
   return { y: cropY / 100, h: (halfH * 2) / 100 };
 }
 
-// Crop from dev_y position — returns a tighter region around the issue
-async function cropByDevY(imgPath, devY) {
+// Crop a region around dev_y and draw a red box around the problem area
+async function cropByDevY(imgPath, devY, box) {
   if (!fs.existsSync(imgPath) || devY === undefined || devY === null) return null;
-  const { y, h } = devYToCrop(devY);
   const meta = await sharp(imgPath).metadata();
   if (meta.width <= 0 || meta.height <= 0) return null;
 
-  const cropY = Math.round(y * meta.height);
-  const cropH = Math.max(Math.round(h * meta.height), Math.round(meta.height * 0.1));
+  // Crop window: ~24% of image height centered on dev_y
+  const { y: cropRatio, h: cropHRatio } = devYToCrop(devY, 12);
+  const cropTop = Math.round(cropRatio * meta.height);
+  const cropH = Math.max(Math.round(cropHRatio * meta.height), Math.round(meta.height * 0.1));
+
+  // Build red box SVG overlay
+  let overlaySvg = null;
+  if (box && box.x !== undefined && box.y !== undefined && box.w !== undefined && box.h !== undefined) {
+    // box values are percentages relative to the full image
+    const bx = Math.round((box.x / 100) * meta.width);
+    const by = Math.round((box.y / 100) * meta.height);
+    const bw = Math.round((box.w / 100) * meta.width);
+    const bh = Math.round((box.h / 100) * meta.height);
+    // Box position relative to the cropped image
+    const relX = bx;
+    const relY = by - cropTop;
+    if (relY + bh > 0 && relY < meta.height && relX + bw > 0 && relX < meta.width) {
+      overlaySvg = Buffer.from(
+        `<svg width="${meta.width}" height="${cropH}">
+          <rect x="${Math.max(0, relX)}" y="${Math.max(0, relY)}"
+                width="${Math.min(bw, meta.width - relX)}" height="${Math.min(bh, cropH - relY)}"
+                fill="none" stroke="#ef4444" stroke-width="4" rx="4"/>
+        </svg>`
+      );
+    }
+  } else {
+    // Fallback: draw a subtle red outline around the entire cropped image
+    overlaySvg = Buffer.from(
+      `<svg width="${meta.width}" height="${cropH}">
+        <rect x="2" y="2" width="${meta.width - 4}" height="${cropH - 4}"
+              fill="none" stroke="#fca5a5" stroke-width="2" stroke-dasharray="8,4" rx="4"/>
+      </svg>`
+    );
+  }
 
   return sharp(imgPath)
-    .extract({ left: 0, top: cropY, width: meta.width, height: cropH })
+    .extract({ left: 0, top: cropTop, width: meta.width, height: cropH })
     .resize({ height: 800, fit: 'inside' })
     .png()
     .toBuffer()
-    .then(buf => 'data:image/png;base64,' + buf.toString('base64'))
+    .then(async (buf) => {
+      const resizedMeta = await sharp(buf).metadata();
+      // Scale the overlay to match the resized image
+      const scaledSvg = overlaySvg.toString().replace(
+        `<svg width="${meta.width}" height="${cropH}"`,
+        `<svg width="${resizedMeta.width}" height="${resizedMeta.height}"`
+      );
+      return sharp(buf)
+        .composite([{ input: Buffer.from(scaledSvg), top: 0, left: 0 }])
+        .toBuffer()
+        .then(b => 'data:image/png;base64,' + b.toString('base64'));
+    })
     .catch(() => null);
+}
+
+// Extract final assistant text from codeflicker stream-json NDJSON output
+function extractTextFromStreamJson(rawLines) {
+  let allText = '';
+  const lines = rawLines.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed);
+      // Collect text from all assistant messages (not just the last one)
+      if (obj.role === 'assistant' && Array.isArray(obj.content)) {
+        for (const c of obj.content) {
+          if (c.type === 'text' && c.text) {
+            allText += c.text;
+          }
+        }
+      }
+    } catch {}
+  }
+  return allText;
 }
 
 // Parse design spec JSON from step 1 output
@@ -150,15 +157,57 @@ function parseDesignSpecFromOutput(text) {
   return null;
 }
 
-// Build step 2 prompt for single-page uicheck (dev comparison against design spec)
-function buildUICheckStep2Prompt(designSpec, devPath, bgPath) {
+// Build step 2 analysis prompt for single-page uicheck (issue detection only)
+// Skill rules are inlined to avoid 3 separate Read tool calls (~45s overhead)
+function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath) {
   const specText = designSpec.map(m =>
     (m.order || '') + '. ' + (m.name || '') + '：' + (m.content || '') + '，视觉特征：' + (m.visual || '')
   ).join('\n');
 
-  let prompt = `你是一个资深的设计走查助手。你收到了一份**设计稿的页面结构清单**和一张**开发稿的截图**。
+  return `你是一个资深的设计走查助手。你收到了一份**设计稿的页面结构清单**、一张**开发稿的截图**和一张**设计稿的截图**。
 
-你的任务：拿着设计稿清单，逐项核对开发稿是否还原到位。
+你的任务：拿着设计稿清单，逐项核对开发稿是否还原到位。只做问题识别，不要调用任何工具（不要 Read，不要 Python）。
+
+## 走查规则（已内嵌，无需额外读取）
+
+### 问题分类
+- **正式问题**：差异明确稳定，不太可能由截图条件造成，可以直接提给开发修改
+  - 模块类型不一致、核心信息结构不一致、对齐关系明显错误
+  - 关键按钮大小/颜色/位置明显不对、核心区域被遮挡/压叠、模块顺序明显错误
+- **疑似问题**：看起来有偏差、对设计质量重要，但暂时不适合直接作为"必须修改"
+  - 波浪曲线疑似更硬、按钮光效疑似过重、背景层次疑似更弱、圆角气质疑似不同、局部留白节奏疑似不同
+- **不纳入**：动态数据/滚动/状态栏/轻微渲染差异
+
+### 检查优先级
+1. 模块缺失 / 顺序错误
+2. 骨架 / 层级 / 对齐问题
+3. 关键组件 / 颖色 / 尺寸
+4. 信息架构错误
+5. 标签 / 图例 / 字段规则错误
+
+### 设计完整性规则
+必须以设计稿为基准逐模块检查：设计稿中每个模块/元素，都必须在开发页确认是否存在。若存在于设计稿但开发页不存在 → 必须输出正式问题。
+
+### 数据排除规则
+以下差异默认不作为问题：
+- 金额、数量、百分比、转化率
+- 日期、时间、用户名、头像、排名、状态
+- 图表数据值、报表数值
+- 数据驱动的图形变化（宽度/高度/面积/曲线）
+- 1-2px 偏移、个别小字体差异、小间距差异
+- 系统差异（状态栏时间、WiFi/电池图标、轻微字体渲染）
+
+对于图表/漏斗：只检查结构、标签、单位、图例、样式/布局/层级；不检查数值一致性和图形形态。
+
+### 问题描述规则
+- 正式问题：只写"问题"+"建议"
+- 疑似问题：只写"问题"+"建议"
+- 不要写成长段小作文，不要在问题描述里重复写位置/优先级/状态
+
+### 图片身份铁则
+- 开发稿 = 代码实现产物（文件名含 dev）
+- 设计稿 = 设计目标效果图（文件名含 design）
+- 两者绝对不能混淆
 
 ## 设计稿的页面结构清单（设计目标）
 ${specText}
@@ -166,124 +215,336 @@ ${specText}
 ## 开发稿截图（代码实现产物）
 图片：@${devPath}
 
-${bgPath ? '## 背景信息\n读取文件：' + bgPath + '\n' : ''}
+## 设计稿截图（设计目标效果图）
+图片：@${designPath}
 
-## 核对维度（只看结构和UI，不看文案）
+${bgPath ? '## 背景信息\n' + bgPath + '\n' : ''}
 
-**A. 模块是否存在**：设计稿中的模块，开发稿中是否缺失或多出？
-**B. 模块顺序**：从上到下顺序是否一致？
-**C. 视觉重点**：设计稿最想强调的内容，在开发稿中是否还是第一重点？
-**D. 模块内部结构**：元素排列（左右/上下/等分）是否一致？
-**E. 样式还原**：背景色/卡片色/圆角/阴影/光晕是否有明显偏差？
-**F. 按钮/操作元素**：按钮是否存在？大小、圆角、位置是否正确？
-**G. 图标**：图标风格是否一致？有无缺失？
-**H. 页面节奏**：开发稿是否明显更挤或更散？
-
-## 【铁则】
-1. 只基于开发稿截图中实际可见的内容分析，严禁编造不存在的元素
-2. **忽略纯文案/文字/数字差异**（按钮文字不同、标题文案不同、数据不同等不报）—— 只看结构、布局、样式
-3. 不推测，不要因为"这种页面通常有XX"就报告XX缺失
-4. 每个问题必须说明：设计稿期望的是什么、开发稿实际是什么
-5. 对问题要具体描述，不能只说"样式不一致"
-6. **只报告结构和UI问题**：模块缺失/错位、布局变化、颜色偏差、圆角/阴影差异、按钮大小/位置变化等
-
-## 输出格式
-**只输出一个 JSON 数组**，不要任何文字。数组包含所有发现的问题，按严重程度排序（P0→P1→P2）。
+## 最终输出
+**只输出一个 JSON 代码块**，不要输出其他文字：
 
 \`\`\`json
-[
-  {"issue": "核心卡片区缺少圆角", "severity": "high", "description": "设计稿期望：圆角16px卡片。开发稿实际：直角卡片。", "dev_y": 45}
-]
+{
+  "confirmed": [
+    {
+      "id": "1",
+      "problem": "一句话问题描述",
+      "suggestion": "一句话修改建议",
+      "priority": "P0",
+      "status": "待修改",
+      "location": "问题所在模块/区域",
+      "devRegion": {"top": 0.0, "bottom": 0.15, "left": 0.0, "right": 1.0},
+      "designRegion": {"top": 0.0, "bottom": 0.15, "left": 0.0, "right": 1.0}
+    }
+  ],
+  "suspected": [
+    {
+      "id": "A1",
+      "problem": "一句话疑似描述",
+      "suggestion": "一句话建议",
+      "priority": "P2",
+      "status": "待确认",
+      "location": "疑似所在模块/区域",
+      "devRegion": {"top": 0.15, "bottom": 0.30, "left": 0.0, "right": 1.0},
+      "designRegion": {"top": 0.15, "bottom": 0.30, "left": 0.0, "right": 1.0}
+    }
+  ]
+}
 \`\`\`
 
-字段说明：
-- issue: 问题标题（15字以内）
-- severity: "high"（P0 严重）/"medium"（P1 中等）/"low"（P2 轻微）
-- description: 具体描述，必须同时包含设计稿期望和开发稿实际
-- dev_y: 问题在开发稿中的垂直位置，0=顶部，50=正中间，100=底部（根据问题描述的位置估算百分比）
+说明：
+- devRegion / designRegion：相对于图片尺寸的比例，范围 0.0-1.0
+- top/left 是起点，bottom/right 是终点
+- left/right 默认为 0.0-1.0（全宽），若问题只在一小块区域内可缩小（如 0.1-0.9）
+- 如果不确定精确坐标，保守估计稍大一点的区域即可
 
-如果没有问题，输出空数组 []。
-
-现在请输出 JSON 数组：`;
-
-  return prompt;
+confirmed：正式问题，id 从 "1" 递增。
+suspected：疑似问题，id 从 "A1" 递增。
+没有某类问题则输出空数组 []。`;
 }
+
+// Generate Python script for cropping and drawing red boxes on screenshots
+// Helper functions for direct Python screenshot (used as fallback)
+function generateScreenshotScript(issueData, devPath, designPath) {
+  const outputDir = path.join(PARENT_DIR, '.claude/skills/uicheck_pro/outputs');
+  
+  // Pass all issue data so Python can read actual devRegion/designRegion
+  const script = `import os, json
+from PIL import Image, ImageDraw
+
+os.makedirs("${outputDir}", exist_ok=True)
+
+dev_img = Image.open("${devPath}")
+design_img = Image.open("${designPath}")
+dev_w, dev_h = dev_img.size
+design_w, design_h = design_img.size
+
+issues = ${JSON.stringify(issueData)}
+
+RED = "#ef4444"
+PAD = 15
+
+def fallbackFromLocation(loc, side, img_h, img_w):
+    """Fallback region estimation from location text if devRegion not provided."""
+    loc = loc.lower()
+    if "banner" in loc or "顶部" in loc or "头" in loc or "主视觉" in loc:
+        return {"top": 0.0, "bottom": 0.30, "left": 0.0, "right": 1.0}
+    elif "cta" in loc or "按钮" in loc or "底部" in loc or "操作" in loc or "footer" in loc:
+        return {"top": 0.75, "bottom": 1.0, "left": 0.0, "right": 1.0}
+    elif "卡片" in loc or "列表" in loc or "规则" in loc or "奖品" in loc or "步骤" in loc or "信息" in loc or "数据" in loc or "产品" in loc:
+        return {"top": 0.25, "bottom": 0.75, "left": 0.0, "right": 1.0}
+    elif "导航" in loc or "nav" in loc or "header" in loc or "tab" in loc:
+        return {"top": 0.0, "bottom": 0.15, "left": 0.0, "right": 1.0}
+    elif "间距" in loc or "留白" in loc or "呼吸" in loc or "圆角" in loc:
+        return {"top": 0.20, "bottom": 0.85, "left": 0.0, "right": 1.0}
+    elif "收益" in loc or "收益率" in loc:
+        return {"top": 0.10, "bottom": 0.30, "left": 0.0, "right": 1.0}
+    elif "参数" in loc or "说明" in loc:
+        return {"top": 0.30, "bottom": 0.60, "left": 0.0, "right": 1.0}
+    else:
+        return {"top": 0.0, "bottom": 1.0, "left": 0.0, "right": 1.0}
+
+for issue in issues:
+    id = issue["id"]
+    dev_region = issue.get("devRegion") or fallbackFromLocation(issue.get("location", ""), "dev", dev_h, dev_w)
+    design_region = issue.get("designRegion") or fallbackFromLocation(issue.get("location", ""), "design", design_h, design_w)
+    
+    # Dev: convert ratios to pixel coords
+    d_top = int(dev_h * dev_region["top"])
+    d_bottom = int(dev_h * dev_region["bottom"])
+    d_left = int(dev_w * dev_region["left"])
+    d_right = int(dev_w * dev_region["right"])
+    dev_crop = dev_img.crop((d_left, d_top, d_right, d_bottom))
+    dev_draw = ImageDraw.Draw(dev_crop)
+    box_w = d_right - d_left
+    box_h = d_bottom - d_top
+    dev_draw.rounded_rectangle([PAD, PAD, box_w - PAD, box_h - PAD], radius=4, outline=RED, width=4)
+    dev_crop.save("${outputDir}/issue_" + str(id) + "_dev.png")
+    
+    # Design: convert ratios to pixel coords
+    ds_top = int(design_h * design_region["top"])
+    ds_bottom = int(design_h * design_region["bottom"])
+    ds_left = int(design_w * design_region["left"])
+    ds_right = int(design_w * design_region["right"])
+    design_crop = design_img.crop((ds_left, ds_top, ds_right, ds_bottom))
+    design_draw = ImageDraw.Draw(design_crop)
+    box_w = ds_right - ds_left
+    box_h = ds_bottom - ds_top
+    design_draw.rounded_rectangle([PAD, PAD, box_w - PAD, box_h - PAD], radius=4, outline=RED, width=4)
+    design_crop.save("${outputDir}/issue_" + str(id) + "_design.png")
+
+print("DONE")
+`;
+  return script;
+}
+
+// Flatten issues from both confirmed and suspected into a flat array for Python
+function flattenIssueData(issueData) {
+  return [...(issueData.confirmed || []), ...(issueData.suspected || [])];
+}
+
+// Execute Python screenshot script directly (fallback if codeflicker fails)
+async function executeScreenshotScript(scriptContent) {
+  const scriptPath = '/tmp/uicheck-screenshot-script.py';
+  fs.writeFileSync(scriptPath, scriptContent);
+  
+  return new Promise((resolve, reject) => {
+    const py = spawn('python3', [scriptPath], {
+      cwd: PARENT_DIR,
+      env: { ...process.env }
+    });
+    
+    let stdout = '';
+    let stderr = '';
+    py.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    py.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    
+    const timer = setTimeout(() => {
+      py.kill('SIGKILL');
+      reject(new Error('Screenshot script timeout (60s)'));
+    }, 60000);
+    
+    py.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0 && stdout.includes('DONE')) {
+        resolve({ success: true, stdout, stderr });
+      } else {
+        reject(new Error(`Screenshot script failed (code ${code}): ${stderr.slice(0, 500)}`));
+      }
+    });
+    
+    py.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+
+// Build step 2 screenshot prompt for single-page uicheck
+// Phase B: codeflicker uses Python tool to crop specific elements + draw red boxes per screenshot rules
+function buildUICheckStep2ScreenshotPrompt(issueData, devPath, designPath, bgPath) {
+  return `你是一个资深的设计走查截图助手。现在已确认问题列表，你需要为每条问题在开发稿和设计稿上找到具体问题元素并框出来。
+
+## 截图规则（必须严格遵守）
+
+### 双图同对象规则
+每个问题必须有开发稿截图 + 设计稿截图，两边框的是同一个问题对象。开发图和设计稿框的不是同一个东西 = 不合格。
+
+### 三类框法
+1. **元素级问题**：框住出问题的具体元素（按钮、标题、图标），框尽量小而准
+2. **模块级问题**：框住整个出问题的模块，两边框的范围要对应
+3. **细节级问题**：框住问题所在的具体细节区域
+
+### 框选要求
+- 只框问题对象本身，不要框过多无关内容
+- 正文说标题问题，截图却框整卡片 = 不合格
+- 只截到了相关区域但没框到问题对象 = 不合格
+
+## 已确认的问题列表
+\`\`\`json
+${JSON.stringify(issueData, null, 2)}
+\`\`\`
+
+## 开发稿截图（代码实现产物）
+图片：@${devPath}
+
+## 设计稿截图（设计目标效果图）
+图片：@${designPath}
+
+${bgPath ? '## 背景信息\n' + bgPath + '\n' : ''}
+
+## 执行要求
+- 不要新增问题，不要删除问题，不要改变 confirmed / suspected 的归类
+- 你只需要根据现有问题列表，为每一条问题分别生成开发稿截图和设计稿截图
+- 必须使用 Python 脚本完成裁图和画框
+- 必须保证开发图和设计稿框住的是同一个问题对象，不能做位置投影
+- 截图要尽量完整，既能看清问题对象，也要保留足够上下文
+- 元素级问题框元素本身；模块级问题框整个模块；细节级问题框对应细节区域
+- 输出目录必须是 .claude/skills/uicheck_pro/outputs/
+- 文件命名必须严格使用 issue_<id>_dev.png 和 issue_<id>_design.png，例如 issue_1_dev.png、issue_A1_design.png
+- 如果某个问题在开发稿找不到对应元素，开发侧框对应模块区域或“未实现”区域
+- 如果你已经生成了截图，也必须在最终 JSON 中回填 images 路径
+
+## 最终输出
+在最后输出一个 JSON 代码块，结构必须与输入问题列表一致，只允许补全 images 字段：
+
+\`\`\`json
+{
+  "confirmed": [
+    {
+      "id": "1",
+      "problem": "...",
+      "suggestion": "...",
+      "priority": "P0",
+      "status": "待修改",
+      "location": "...",
+      "images": [".claude/skills/uicheck_pro/outputs/issue_1_dev.png", ".claude/skills/uicheck_pro/outputs/issue_1_design.png"]
+    }
+  ],
+  "suspected": []
+}
+\`\`\``;
+}
+
+function attachGeneratedIssueImages(issueData) {
+  const outputsDir = path.join(PARENT_DIR, '.claude/skills/uicheck_pro/outputs');
+  const enrich = (items = []) => items.map((issue) => {
+    const id = String(issue.id || '').trim();
+    const devImage = `.claude/skills/uicheck_pro/outputs/issue_${id}_dev.png`;
+    const designImage = `.claude/skills/uicheck_pro/outputs/issue_${id}_design.png`;
+    const devPath = path.join(PARENT_DIR, devImage);
+    const designPath = path.join(PARENT_DIR, designImage);
+    const images = fs.existsSync(devPath) && fs.existsSync(designPath)
+      ? [devImage, designImage]
+      : (issue.images || []);
+    return { ...issue, images };
+  });
+
+  return {
+    confirmed: enrich(issueData?.confirmed),
+    suspected: enrich(issueData?.suspected)
+  };
+}
+
 
 // Generate issue table from Claude output (for both single-page step 2 and folder mode)
 async function generateIssueTable(fullOutput, files, typeDir, isFolderMode, res) {
   try {
-    const issues = parseIssuesFromOutput(fullOutput);
-    if (issues && issues.length > 0) {
-      // Build file path lookup
-      const fileMap = {};
-      if (isFolderMode) {
-        for (const f of files) fileMap[f] = path.join(typeDir, f);
-      } else {
-        const devFile = files.find(f => /dev_screenshot/i.test(f));
-        const designFile = files.find(f => /design_mockup/i.test(f));
-        fileMap._dev = path.join(typeDir, devFile);
-        fileMap._design = path.join(typeDir, designFile);
-      }
+    const data = parseIssuesFromOutput(fullOutput);
+    if (!data) return;
 
-      // Cache image metadata
-      const metaCache = {};
-      const getMeta = async (filePath) => {
-        if (!metaCache[filePath]) {
-          metaCache[filePath] = await sharp(filePath).metadata();
-        }
-        return metaCache[filePath];
-      };
+    async function imageToBase64(imgPath) {
+      // Resolve relative paths from PARENT_DIR (server cwd may be designer-platform)
+      const resolvedPath = imgPath.startsWith('/') ? imgPath : path.join(PARENT_DIR, imgPath);
+      if (!resolvedPath || !fs.existsSync(resolvedPath)) return null;
+      try {
+        const buf = fs.readFileSync(resolvedPath);
+        return 'data:image/png;base64,' + buf.toString('base64');
+      } catch { return null; }
+    }
 
-      const tableRows = [];
-      for (const issue of issues) {
-        let devPath, designPath;
-        if (isFolderMode) {
-          const pageName = issue.page || '';
-          const devFile = files.find(f => f === `dev_${pageName}`);
-          const designFile = files.find(f => f === `design_${pageName}`);
-          devPath = devFile ? fileMap[devFile] : null;
-          designPath = designFile ? fileMap[designFile] : null;
-        } else {
-          devPath = fileMap._dev;
-          designPath = fileMap._design;
-        }
-
+    async function buildRows(items) {
+      const rows = [];
+      for (const issue of items) {
         let devImg = null, designImg = null;
-        // Use dev_y/design_y (numeric 0-100) for precise cropping, fallback to dev_region/design_region
-        if (devPath) {
-          if (issue.dev_y !== undefined && issue.dev_y !== null) {
-            devImg = await cropByDevY(devPath, issue.dev_y);
-          } else if (issue.dev_region) {
-            const meta = await getMeta(devPath);
-            devImg = await cropRegion(devPath, issue.dev_region, meta.height);
-          }
+
+        // New SKILL format: images array of paths (Claude already cropped + boxed)
+        if (issue.images && issue.images.length >= 2) {
+          devImg = await imageToBase64(issue.images[0]);
+          designImg = await imageToBase64(issue.images[1]);
+          console.log(`[uicheck buildRows] ${issue.id}: images=${JSON.stringify(issue.images)} devImg=${devImg ? 'YES('+devImg.length+')' : 'NULL'} designImg=${designImg ? 'YES('+designImg.length+')' : 'NULL'}`);
         }
-        if (designPath) {
-          if (issue.design_y !== undefined && issue.design_y !== null) {
-            designImg = await cropByDevY(designPath, issue.design_y);
-          } else if (issue.dev_y !== undefined && issue.dev_y !== null) {
-            // Fallback: use same position as dev side
-            designImg = await cropByDevY(designPath, issue.dev_y);
-          } else if (issue.design_region) {
-            const meta = await getMeta(designPath);
-            designImg = await cropRegion(designPath, issue.design_region, meta.height);
+        // Fallback: legacy format with dev_y coordinate
+        else if (!isFolderMode) {
+          const devFile = files.find(f => /dev_screenshot/i.test(f));
+          const designFile = files.find(f => /design_mockup/i.test(f));
+          if (devFile && issue.dev_y !== undefined) {
+            devImg = await cropByDevY(path.join(typeDir, devFile), issue.dev_y);
+          }
+          if (designFile && issue.dev_y !== undefined) {
+            designImg = await cropByDevY(path.join(typeDir, designFile), issue.dev_y);
           }
         }
 
-        tableRows.push({
+        // Map both formats to unified row schema
+        rows.push({
+          id: issue.id || '',
           page: issue.page || '',
           issue: issue.issue || '',
+          problem: issue.problem || issue.issue || '',
           location: issue.location || '',
           severity: issue.severity || 'medium',
-          description: issue.description || '',
+          priority: issue.priority || (issue.severity === 'high' ? 'P0' : issue.severity === 'low' ? 'P2' : 'P1'),
+          status: issue.status || (isFolderMode ? '待修改' : '待修改'),
+          confidence: issue.confidence || '',
+          suspectLevel: issue.suspectLevel || '',
+          description: issue.description || issue.problem || '',
           suggestion: issue.suggestion || '',
+          reason: issue.reason || '',
+          basis: issue.basis || '',
+          whyNotConfirmed: issue.whyNotConfirmed || '',
+          impact: issue.impact || '',
+          verifySuggestion: issue.verifySuggestion || '',
           devImg,
           designImg
         });
       }
+      return rows;
+    }
 
-      res.write(`data: ${JSON.stringify({ type: 'table', rows: tableRows })}\n\n`);
-      console.log(`[uicheck] generated ${tableRows.length} table rows with cropped images`);
+    // Send confirmed issues table
+    if (data.confirmed && data.confirmed.length > 0) {
+      const confirmedRows = await buildRows(data.confirmed);
+      res.write(`data: ${JSON.stringify({ type: 'table', tableType: 'confirmed', rows: confirmedRows })}\n\n`);
+      console.log(`[uicheck] generated ${confirmedRows.length} confirmed rows`);
+    }
+
+    // Send suspected issues table
+    if (data.suspected && data.suspected.length > 0) {
+      const suspectedRows = await buildRows(data.suspected);
+      res.write(`data: ${JSON.stringify({ type: 'table', tableType: 'suspected', rows: suspectedRows })}\n\n`);
+      console.log(`[uicheck] generated ${suspectedRows.length} suspected rows`);
     }
   } catch (err) {
     console.log('[uicheck] table generation error:', err.message);
@@ -302,7 +563,13 @@ const storage = multer.diskStorage({
     cb(null, unique + '-' + file.originalname);
   }
 });
-const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } });
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 20 * 1024 * 1024,
+    fieldSize: 120 * 1024 * 1024
+  }
+});
 
 // Figma-specific upload storage (fixed directory)
 const figmaStorage = multer.diskStorage({
@@ -330,26 +597,120 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '50mb' }));
 
-// Upload endpoint - clean old files BEFORE multer writes
-app.post('/api/upload/:type', (req, res, next) => {
+// Upload endpoint - supports both file upload and URL content fetching
+app.post('/api/upload/:type', async (req, _res, next) => {
   const type = req.params.type;
   const typeDir = getInputsDir(type);
-  // Clean old files before multer writes new ones
+  // Clean old input files before multer writes new ones
   const existingFiles = fs.readdirSync(typeDir);
   for (const file of existingFiles) {
     fs.unlinkSync(path.join(typeDir, file));
   }
   console.log(`[${type}] cleaned ${existingFiles.length} old files from ${typeDir}`);
+  // Also clean old screenshot outputs (all files in outputs directory)
+  if (type === 'uicheck') {
+    const outputsDir = path.join(PARENT_DIR, '.claude/skills/uicheck_pro/outputs');
+    if (fs.existsSync(outputsDir)) {
+      const oldFiles = fs.readdirSync(outputsDir);
+      for (const f of oldFiles) {
+        fs.unlinkSync(path.join(outputsDir, f));
+      }
+      console.log(`[uicheck] cleaned ${oldFiles.length} old files from ${outputsDir}`);
+    }
+  }
   next();
-}, upload.array('files', 10), (req, res) => {
+}, upload.array('files', 10), async (req, res) => {
   const { type } = req.params;
-  const content = req.body.content || '';
+  const typeDir = getInputsDir(type);
+  let content = req.body.content || '';
   const persona = req.body.persona || '';
   const taskDesc = req.body.taskDesc || '';
-  const newFiles = (req.files || []).map(f => ({ path: f.path, originalname: f.originalname }));
+  let newFiles = (req.files || []).map(f => ({ path: f.path, originalname: f.originalname }));
 
-  res.json({ ok: true, type, content, persona, taskDesc, files: newFiles });
+  // Handle URL input: fetch content and save as text file
+  const isUrl = req.body.isUrl === 'true' || req.body.isUrl === true;
+  if (content && newFiles.length === 0) {
+    if (isUrl) {
+      const pageContent = await fetchUrlContent(content);
+      if (pageContent) {
+        const fileName = Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '-prd.txt';
+        const filePath = path.join(typeDir, fileName);
+        fs.writeFileSync(filePath, `Source URL: ${content}\n\n${pageContent}`, 'utf-8');
+        newFiles = [{ path: filePath, originalname: fileName }];
+        console.log(`[${type}] fetched URL and saved as ${fileName}`);
+      } else {
+        return res.status(400).json({ ok: false, error: '无法获取该 URL 的内容，请尝试直接粘贴文本' });
+      }
+    } else {
+      // Browser fetched or direct paste
+      const sourceUrl = req.body.sourceUrl || '';
+      const fileName = Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '-prd.txt';
+      const filePath = path.join(typeDir, fileName);
+      const header = sourceUrl ? `Source URL: ${sourceUrl}\n\n` : '';
+      fs.writeFileSync(filePath, `${header}${content}`, 'utf-8');
+      newFiles = [{ path: filePath, originalname: fileName }];
+      console.log(`[${type}] saved fetched/pasted text as ${fileName} (${content.length} bytes)`);
+    }
+  }
+
+  // Save PRD images from extension extraction
+  const prdImagesRaw = req.body.prdImages || '';
+  let savedImages = [];
+  if (prdImagesRaw) {
+    try {
+      const images = typeof prdImagesRaw === 'string' ? JSON.parse(prdImagesRaw) : prdImagesRaw;
+      for (const img of (Array.isArray(images) ? images : [images])) {
+        if (img.dataUrl && img.dataUrl.startsWith('data:image')) {
+          const base64 = img.dataUrl.split(',')[1];
+          const imgBuffer = Buffer.from(base64, 'base64');
+          let meta = null;
+          try {
+            meta = await sharp(imgBuffer).metadata();
+          } catch {}
+          if (!isLikelyPRDImage(meta, img)) {
+            console.log(`[${type}] skipped non-prd image: ${img.src || img.alt || '(unknown)'}`);
+            continue;
+          }
+          const mimeMatch = img.dataUrl.match(/data:image\/(\w+);/);
+          const ext = mimeMatch ? (mimeMatch[1] === 'jpeg' ? 'jpg' : mimeMatch[1]) : 'jpg';
+          const imgName = img.name || ('prd_img_' + savedImages.length);
+          const imgPath = path.join(typeDir, imgName + '.' + ext);
+          fs.writeFileSync(imgPath, imgBuffer);
+          savedImages.push({
+            path: imgPath,
+            originalname: imgName + '.' + ext,
+            caption: cleanPRDImageText(img.caption || ''),
+            alt: cleanPRDImageText(img.alt || '')
+          });
+          console.log(`[${type}] saved prd image: ${imgName}.${ext} (${imgBuffer.length} bytes)`);
+        }
+      }
+    } catch (e) {
+      console.log(`[${type}] image parse error:`, e.message);
+    }
+  }
+
+  newFiles = newFiles.concat(savedImages);
+
+  res.json({ ok: true, type, content, persona, taskDesc, files: newFiles, imageCount: savedImages.length });
 });
+
+function isLikelyPRDImage(meta, img) {
+  const w = Math.max(meta?.width || 0, img.width || 0, img.displayWidth || 0);
+  const h = Math.max(meta?.height || 0, img.height || 0, img.displayHeight || 0);
+  if (w < 260 || h < 160 || w * h < 90000) return false;
+  const ratio = w / Math.max(h, 1);
+  if (w <= 320 && h <= 320 && ratio > 0.7 && ratio < 1.45) return false;
+  const text = `${img.src || ''} ${img.alt || ''} ${img.caption || ''}`.toLowerCase();
+  if (/(avatar|portrait|profile|head|user|face|emoji|icon|logo|badge|comment|like|reaction|default|头像|用户|评论|点赞)/i.test(text)) return false;
+  return true;
+}
+
+function cleanPRDImageText(text) {
+  text = String(text || '').replace(/\s+/g, ' ').trim();
+  if (/vodka-|embeddedobject|image-container|image-wrapper|goog-inline-block/i.test(text)) return '';
+  return text.slice(0, 80);
+}
 
 // Analyze endpoint (SSE streaming)
 app.get('/api/analyze/:type', (req, res) => {
@@ -380,10 +741,23 @@ app.get('/api/analyze/:type', (req, res) => {
     return res.end();
   }
 
+  // Validate content length - only for PRD type to prevent analyzing empty/fetch-failed content
+  if (type === 'prd') {
+    const mainFile = files.find(f => /prd\.txt$/i.test(f)) || files[0];
+    const filePath = path.join(typeDir, mainFile);
+    let fileContent = fs.readFileSync(filePath, 'utf-8');
+    // Strip URL header to check actual content
+    const actualContent = fileContent.replace(/^Source URL:.*?\n\n?/s, '').trim();
+    if (actualContent.length < 500) {
+      res.write(`data: ${JSON.stringify({ type: 'error', content: 'PRD 内容过短（' + actualContent.length + ' 字符，链接无法访问或抓取内容不足），请切换到文本粘贴模式手动复制内容' })}\n\n`);
+      return res.end();
+    }
+  }
+
   console.log(`[${type}] analyzing files:`, files);
   const prompt = buildPrompt(files, type);
 
-  res.write(`data: ${JSON.stringify({ type: 'status', content: 'Claude Code 启动中...' })}\n\n`);
+  res.write(`data: ${JSON.stringify({ type: 'status', content: 'CodeFlicker 启动中...' })}\n\n`);
 
   // For uicheck single-page mode: two-step flow to prevent dev/design confusion
   // Step 1 (already done above): design-only analysis → module spec
@@ -402,18 +776,21 @@ app.get('/api/analyze/:type', (req, res) => {
 
   // colortry uses interactive mode (needs to run bash for color analysis script)
   // lowfi/builder use interactive mode (need to read skills and generate figma plugin code)
-  // Other types use --print mode
+  // uicheck uses stream-json to prevent process hang / truncated output
   const isInteractive = type === 'colortry' || type === 'lowfi' || type === 'builder';
+  const useStreamJson = type === 'uicheck';
+  const outputFormat = useStreamJson ? 'stream-json' : 'text';
   const claudeArgs = isInteractive
-    ? [prompt, '--permission-mode', 'bypassPermissions', '--output-format', 'text']
-    : ['--print', prompt, '--permission-mode', 'bypassPermissions', '--output-format', 'text'];
-  const claude = spawn('claude', claudeArgs, {
+    ? ['--approval-mode', 'yolo', '--output-format', outputFormat, prompt]
+    : ['-q', '--approval-mode', 'yolo', '--output-format', outputFormat, prompt];
+  const claude = spawn('codeflicker', claudeArgs, {
     cwd: PARENT_DIR,
     env: { ...process.env }
   });
 
   // Collect full output for uicheck post-processing
-  let fullOutput = '';
+  let fullRawOutput = '';  // raw stream-json or text
+  let fullTextOutput = ''; // extracted text (for stream-json mode)
 
   // For uicheck single-page mode, hide step 1 output from frontend
   const uicheckSinglePage = type === 'uicheck' && (() => {
@@ -424,21 +801,41 @@ app.get('/api/analyze/:type', (req, res) => {
 
   claude.stdout.on('data', (chunk) => {
     const text = chunk.toString();
-    fullOutput += text;
-    if (!uicheckSinglePage) {
+    fullRawOutput += text;
+    if (!uicheckSinglePage && !useStreamJson) {
       res.write(`data: ${JSON.stringify({ type: 'chunk', content: text })}\n\n`);
     }
   });
 
   claude.stderr.on('data', (chunk) => {
     const text = chunk.toString();
-    res.write(`data: ${JSON.stringify({ type: 'stderr', content: text })}\n\n`);
+    if (!useStreamJson) {
+      res.write(`data: ${JSON.stringify({ type: 'stderr', content: text })}\n\n`);
+    }
+    console.log(`[${type} stderr]`, text.slice(0, 200));
   });
 
   claude.on('close', async (code) => {
+    // For stream-json mode, extract the text content
+    if (useStreamJson) {
+      fullTextOutput = extractTextFromStreamJson(fullRawOutput);
+    } else {
+      fullTextOutput = fullRawOutput;
+    }
     // Debug: save full output
-    fs.writeFileSync('/tmp/claude-uicheck-output.txt', fullOutput);
-    console.log('[uicheck] full output length:', fullOutput.length);
+    fs.writeFileSync('/tmp/claude-uicheck-output.txt', fullTextOutput);
+    fs.writeFileSync('/tmp/claude-uicheck-output-raw.txt', fullRawOutput);
+    console.log('[uicheck] full text output length:', fullTextOutput.length, 'raw length:', fullRawOutput.length);
+
+    if (code !== 0) {
+      const quotaErr = /quota|authenticate|403|token-plan/i.test(fullTextOutput + fullRawOutput);
+      const errMsg = quotaErr
+        ? 'CodeFlicker 调用失败：账号额度或鉴权异常（403/token-plan）。请先恢复 CodeFlicker 可用额度后重试。'
+        : `CodeFlicker 调用失败（退出码 ${code}）。请查看服务端日志和 /tmp/claude-uicheck-output.txt。`;
+      res.write(`data: ${JSON.stringify({ type: 'error', content: errMsg })}\n\n`);
+      res.end();
+      return;
+    }
 
     // For uicheck: two-step flow for single-page mode
     if (type === 'uicheck') {
@@ -449,7 +846,7 @@ app.get('/api/analyze/:type', (req, res) => {
       if (!isFolderMode) {
         // Single-page mode: step 1 output is the design spec JSON
         // Now run step 2: compare dev screenshot against the spec
-        const designSpec = parseDesignSpecFromOutput(fullOutput);
+        const designSpec = parseDesignSpecFromOutput(fullTextOutput);
         const devFile = files.find(f => /dev_screenshot/i.test(f));
         const bgFile = files.find(f => /background\.txt$/i.test(f));
         const bgPath = bgFile ? path.join(typeDir, bgFile) : '';
@@ -459,41 +856,194 @@ app.get('/api/analyze/:type', (req, res) => {
           res.write(`data: ${JSON.stringify({ type: 'status', content: '正在对比开发稿...' })}\n\n`);
 
           const devPath = path.join(typeDir, devFile);
-          const step2Prompt = buildUICheckStep2Prompt(designSpec, devPath, bgPath);
+          const designFile = files.find(f => /design_mockup/i.test(f));
+          const designFilePath = designFile ? path.join(typeDir, designFile) : '';
+          const step2AnalysisPrompt = buildUICheckStep2AnalysisPrompt(designSpec, devPath, designFilePath, bgPath);
 
-          const claude2 = spawn('claude', [
-            '--print', step2Prompt,
-            '--permission-mode', 'bypassPermissions',
-            '--output-format', 'text'
+          // Phase A: issue detection only (keep Read, no Python) for fast stable completion
+          const claude2 = spawn('codeflicker', [
+            '-q', '--approval-mode', 'yolo',
+            '--output-format', 'stream-json',
+            step2AnalysisPrompt
           ], {
             cwd: PARENT_DIR,
             env: { ...process.env }
           });
 
-          let step2Output = '';
+          const STEP2_ANALYSIS_TIMEOUT_MS = 8 * 60 * 1000;
+          let step2AnalysisTimedOut = false;
+          const step2AnalysisTimer = setTimeout(() => {
+            step2AnalysisTimedOut = true;
+            console.log('[uicheck step2 analysis] timeout - killing process');
+            claude2.kill('SIGTERM');
+            setTimeout(() => { try { claude2.kill('SIGKILL'); } catch {} }, 3000);
+          }, STEP2_ANALYSIS_TIMEOUT_MS);
+
+          let step2StartTime = Date.now();
+          const heartbeat = setInterval(() => {
+            const elapsed = Math.round((Date.now() - step2StartTime) / 1000);
+            res.write(`data: ${JSON.stringify({ type: 'status', content: `正在对比开发稿...（已运行 ${elapsed} 秒）` })}\n\n`);
+          }, 15000);
+
+          let step2RawLines = '';
           claude2.stdout.on('data', (chunk) => {
-            const text = chunk.toString();
-            step2Output += text;
-            res.write(`data: ${JSON.stringify({ type: 'chunk', content: text })}\n\n`);
+            step2RawLines += chunk.toString();
           });
           claude2.stderr.on('data', (chunk) => {
-            res.write(`data: ${JSON.stringify({ type: 'stderr', content: chunk.toString() })}\n\n`);
+            console.log('[uicheck step2 analysis stderr]', chunk.toString().slice(0, 200));
           });
 
           claude2.on('close', async (code2) => {
-            // Parse issues from step 2 output and generate table
-            await generateIssueTable(step2Output, files, typeDir, isFolderMode, res);
-            res.write(`data: ${JSON.stringify({ type: 'done', code: code2 })}\n\n`);
-            res.end();
+            clearTimeout(step2AnalysisTimer);
+
+            const analysisOutput = extractTextFromStreamJson(step2RawLines) || step2RawLines;
+            fs.writeFileSync('/tmp/codeflicker-uicheck-step2-analysis.txt', analysisOutput);
+            console.log('[uicheck step2 analysis] closed, code:', code2, 'output length:', analysisOutput.length);
+
+            if (step2AnalysisTimedOut) {
+              clearInterval(heartbeat);
+              res.write(`data: ${JSON.stringify({ type: 'error', content: '开发稿问题识别超时（8分钟），请查看 /tmp/codeflicker-uicheck-step2-analysis.txt' })}\n\n`);
+              res.end();
+              return;
+            }
+
+            if (code2 !== 0) {
+              clearInterval(heartbeat);
+              const quotaErr2 = /quota|authenticate|403|token-plan/i.test(analysisOutput);
+              const errMsg2 = quotaErr2
+                ? '开发稿对比失败：CodeFlicker 额度或鉴权异常（403/token-plan）。请先恢复可用额度后重试。'
+                : `开发稿对比失败（退出码 ${code2}）。请查看服务端日志和 /tmp/codeflicker-uicheck-step2-analysis.txt`;
+              res.write(`data: ${JSON.stringify({ type: 'error', content: errMsg2 })}\n\n`);
+              res.end();
+              return;
+            }
+
+            if (analysisOutput.trim()) {
+              res.write(`data: ${JSON.stringify({ type: 'chunk', content: analysisOutput })}\n\n`);
+            }
+
+            const issueData = parseIssuesFromOutput(analysisOutput);
+            if (!issueData) {
+              clearInterval(heartbeat);
+              res.write(`data: ${JSON.stringify({ type: 'error', content: '开发稿问题识别完成，但未解析到有效 JSON。请查看 /tmp/codeflicker-uicheck-step2-analysis.txt' })}\n\n`);
+              res.end();
+              return;
+            }
+
+            res.write(`data: ${JSON.stringify({ type: 'status', content: '正在生成问题截图...' })}\n\n`);
+
+            // Phase B: Use codeflicker with Python tool - model reads screenshot rules, sees images, then calls Python to crop specific elements + draw red boxes
+            const screenshotPrompt = buildUICheckStep2ScreenshotPrompt(issueData, devPath, designFilePath, bgPath);
+            const claude3 = spawn('codeflicker', [
+              '-q', '--approval-mode', 'yolo',
+              '--output-format', 'stream-json',
+              screenshotPrompt
+            ], {
+              cwd: PARENT_DIR,
+              env: { ...process.env }
+            });
+
+            const STEP2_SCREENSHOT_TIMEOUT_MS = 12 * 60 * 1000;
+            let step2ScreenshotTimedOut = false;
+            const step2ScreenshotTimer = setTimeout(() => {
+              step2ScreenshotTimedOut = true;
+              console.log('[uicheck step2 screenshot] timeout - killing process');
+              claude3.kill('SIGTERM');
+              setTimeout(() => { try { claude3.kill('SIGKILL'); } catch {} }, 3000);
+            }, STEP2_SCREENSHOT_TIMEOUT_MS);
+
+            let screenshotStartTime = Date.now();
+            const screenshotHeartbeat = setInterval(() => {
+              const elapsed = Math.round((Date.now() - screenshotStartTime) / 1000);
+              res.write(`data: ${JSON.stringify({ type: 'status', content: `正在生成问题截图...（已运行 ${elapsed} 秒）` })}\n\n`);
+            }, 15000);
+
+            let step3RawLines = '';
+            claude3.stdout.on('data', (chunk) => {
+              step3RawLines += chunk.toString();
+            });
+            claude3.stderr.on('data', (chunk) => {
+              console.log('[uicheck step2 screenshot stderr]', chunk.toString().slice(0, 200));
+            });
+
+            claude3.on('close', async (code3) => {
+              clearInterval(heartbeat);
+              clearTimeout(step2ScreenshotTimer);
+              clearInterval(screenshotHeartbeat);
+
+              const screenshotOutput = extractTextFromStreamJson(step3RawLines);
+              fs.writeFileSync('/tmp/codeflicker-uicheck-step2-screenshot.txt', screenshotOutput || step3RawLines);
+              console.log('[uicheck step2 screenshot] closed, code:', code3, 'output length:', screenshotOutput.length);
+
+              if (step2ScreenshotTimedOut) {
+                const mergedData = attachGeneratedIssueImages(issueData);
+                const hasAnyImages = [...(mergedData.confirmed || []), ...(mergedData.suspected || [])].some(issue => issue.images && issue.images.length >= 2);
+                if (hasAnyImages) {
+                  await generateIssueTable(`\`\`\`json\n${JSON.stringify(mergedData, null, 2)}\n\`\`\``, files, typeDir, isFolderMode, res);
+                  res.write(`data: ${JSON.stringify({ type: 'done', code: 0 })}\n\n`);
+                } else {
+                  res.write(`data: ${JSON.stringify({ type: 'error', content: '问题截图生成超时（12分钟），且未找到可用截图。请查看 /tmp/codeflicker-uicheck-step2-screenshot.txt' })}\n\n`);
+                }
+                res.end();
+                return;
+              }
+
+              if (code3 !== 0) {
+                const mergedData = attachGeneratedIssueImages(issueData);
+                const hasAnyImages = [...(mergedData.confirmed || []), ...(mergedData.suspected || [])].some(issue => issue.images && issue.images.length >= 2);
+                if (hasAnyImages) {
+                  await generateIssueTable(`\`\`\`json\n${JSON.stringify(mergedData, null, 2)}\n\`\`\``, files, typeDir, isFolderMode, res);
+                  res.write(`data: ${JSON.stringify({ type: 'done', code: 0 })}\n\n`);
+                } else {
+                  res.write(`data: ${JSON.stringify({ type: 'error', content: `问题截图生成失败（退出码 ${code3}）。请查看 /tmp/codeflicker-uicheck-step2-screenshot.txt` })}\n\n`);
+                }
+                res.end();
+                return;
+              }
+
+              const screenshotParsed = parseIssuesFromOutput(screenshotOutput);
+              const mergedData = attachGeneratedIssueImages(issueData);
+              if (screenshotParsed) {
+                const b2a = new Map();
+                for (const item of (screenshotParsed.confirmed || [])) {
+                  if (item.images && item.images.length >= 2) b2a.set(String(item.id), item.images);
+                }
+                for (const item of (screenshotParsed.suspected || [])) {
+                  if (item.images && item.images.length >= 2) b2a.set(String(item.id), item.images);
+                }
+                const enrich = (items) => items.map(item => {
+                  const bImages = b2a.get(String(item.id));
+                  return { ...item, images: bImages || item.images };
+                });
+                mergedData.confirmed = enrich(mergedData.confirmed || []);
+                mergedData.suspected = enrich(mergedData.suspected || []);
+              }
+              await generateIssueTable(`\`\`\`json\n${JSON.stringify(mergedData, null, 2)}\n\`\`\``, files, typeDir, isFolderMode, res);
+              res.write(`data: ${JSON.stringify({ type: 'done', code: code3 })}\n\n`);
+              res.end();
+            });
+
+            claude3.on('error', (err) => {
+              clearInterval(heartbeat);
+              clearTimeout(step2ScreenshotTimer);
+              clearInterval(screenshotHeartbeat);
+              res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`);
+              res.end();
+            });
           });
 
           claude2.on('error', (err) => {
+            clearTimeout(step2AnalysisTimer);
+            clearInterval(heartbeat);
             res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`);
             res.end();
           });
           return; // Don't send done yet — step 2 will
         } else {
           console.log('[uicheck step 2] missing dev file or empty design spec');
+          res.write(`data: ${JSON.stringify({ type: 'error', content: '设计稿结构解析失败，请检查设计稿是否可读，或查看 /tmp/claude-uicheck-output.txt 排查 Claude 输出。' })}\n\n`);
+          res.end();
+          return;
         }
       }
     }
@@ -501,7 +1051,7 @@ app.get('/api/analyze/:type', (req, res) => {
     // For lowfi/builder: extract figma plugin code
     if (type === 'lowfi' || type === 'builder') {
       try {
-        const pluginMatch = fullOutput.match(/```figma-plugin\s*([\s\S]*?)```/);
+        const pluginMatch = fullTextOutput.match(/```figma-plugin\s*([\s\S]*?)```/);
         if (pluginMatch) {
           res.write(`data: ${JSON.stringify({ type: 'figma-code', content: pluginMatch[1].trim() })}\n\n`);
           console.log(`[${type}] extracted figma plugin code`);
@@ -521,14 +1071,45 @@ app.get('/api/analyze/:type', (req, res) => {
   });
 });
 
+// Fetch URL content
+async function fetchUrlContent(url) {
+  try {
+    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!response.ok) return null;
+    const html = await response.text();
+    // Strip HTML tags to get text content
+    const text = html.replace(/<script[\s\S]*?<\/script>/gi, '')
+                     .replace(/<style[\s\S]*?<\/style>/gi, '')
+                     .replace(/<[^>]+>/g, ' ')
+                     .replace(/&nbsp;/g, ' ')
+                     .replace(/\s+/g, ' ')
+                     .trim();
+    if (text.length < 500 || /^(login|登录|sign in)$/i.test(text)) return null;
+    return text.substring(0, 30000);
+  } catch {
+    return null;
+  }
+}
+
 // Build prompts for each type
 function buildPRDPrompt(files, type) {
-  const fileList = files.join(', ');
+  const txtFiles = files.filter(f => /\.txt$|\.md$/i.test(f));
+  const imgFiles = files.filter(f => /\.(png|jpg|jpeg|webp)$/i.test(f));
+
+  let imgStep = '';
+  if (imgFiles.length > 0) {
+    imgStep = 'Step 3（图片）：以下上传了 ' + imgFiles.length + ' 张图片。注意：其中可能混有非设计相关截图（用户信息、表格数据、背景资料等），请只关注与产品设计相关的图片（原型图、流程图、界面线框图、交互示意），忽略其他无关截图：\n';
+    imgFiles.forEach(f => {
+      imgStep += '- @designer-platform/inputs/' + type + '/' + f + '\n';
+    });
+    imgStep += '\n';
+  }
+
   return `你是一名资深 UX 设计评审助手。请按以下步骤执行：
 
 Step 1：使用 Read 工具读取 .claude/skills/prdcheck/SKILL.md，了解评审规则。
-Step 2：使用 Read 工具逐一读取 designer-platform/inputs/${type}/ 目录下的文件：${fileList}
-Step 3：按照 SKILL.md 中的规则进行分析。
+Step 2：使用 Read 工具逐一读取 designer-platform/inputs/${type}/ 目录下的文本文件：${txtFiles.join(', ') || '无'}
+${imgStep}Step 4：按照 SKILL.md 中的规则进行分析。
 
 核心原则：
 1. 只基于已给信息分析，不做过度发散，不要强行补一大堆通用问题
@@ -543,12 +1124,103 @@ D. 原型表达：是否表达清楚主流程、关键动作是否缺反馈、�
 E. 状态和反馈：默认态/选中态/禁用态/成功失败/空态/加载态是否够用
 F. 规则和文案：同一个动作在不同页面说法是否一致、按钮文案是否匹配用户预期
 
-输出格式：
-1. 当前需求在做什么（2-4句话）
-2. 页面与流程理解
-3. 合理点
-4. 我看到的问题（每条包含：问题点、为什么不合理、会影响什么、建议怎么确认或调整）
-5. 建议优先确认的问题（按重要程度排序）`;
+## 输出要求
+
+请先用 Markdown 输出分析内容（格式自由），然后在最后**必须输出一个 JSON 代码块**，包含结构化数据，格式如下：
+
+\`\`\`json
+{
+  "summary": {
+    "goal": "一句话概括需求目标",
+    "target_users": ["目标用户群体1", "目标用户群体2"],
+    "core_scenarios": ["核心场景1", "核心场景2"],
+    "main_modules": ["模块1", "模块2", "模块3"],
+    "risk_count": {
+      "p0": 0,
+      "p1": 0,
+      "p2": 0
+    },
+    "issue_count": 0,
+    "open_question_count": 0
+  },
+  "flow": {
+    "pages": ["页面1", "页面2"],
+    "main_path": ["入口", "页面A", "页面B", "结果页"],
+    "unclear_steps": ["不清楚的步骤"]
+  },
+  "issues": [
+    {
+      "id": 1,
+      "type": "formal",
+      "priority": "P0",
+      "module": "所属模块",
+      "problem": "问题标题",
+      "reason": "为什么不合理",
+      "impact": "会影响什么",
+      "suggestion": "建议怎么调整",
+      "pm_question": "需要向 PM 确认的问题（可选，无则空字符串）"
+    }
+  ],
+  "design_focus": {
+    "关键决策点1": "说明",
+    "关键决策点2": "说明"
+  },
+  "score": {
+    "total": 0,
+    "dimensions": {
+      "completeness": { "score": 0, "label": "完整性", "desc": "评分理由" },
+      "flow_clarity": { "score": 0, "label": "流程清晰", "desc": "评分理由" },
+      "state_coverage": { "score": 0, "label": "状态覆盖", "desc": "评分理由" },
+      "rule_consistency": { "score": 0, "label": "规则一致", "desc": "评分理由" }
+    }
+  }
+}
+\`\`\`
+
+每个维度的 desc 字段必须填写一句简短的评分理由（20字以内）。
+issues 数组包含所有发现的问题。priority 为 "P0"（严重）、"P1"（中等）、"P2"（轻微）或 "待确认"。
+design_focus 是一个对象，key 为关注点名称，value 为详细说明。
+
+## 评分规则（满分 80，4 个维度各 20 分）
+
+以下规则必须严格按公式计算，确保相同内容每次评分结果一致：
+
+1. **完整性 (completeness)** — 按页面和模块覆盖度计分：
+   - 满分 20。如果文档包含 ≥4 个页面且每页有 ≥2 个模块描述，给 20 分。
+   - 3 个页面或模块描述基本完整 → 17 分。
+   - 2 个页面或模块描述清晰但有遗漏 → 14 分。
+   - 1-2 个页面且多处遗漏 → 10 分。
+   - 只有 1 个页面且描述不充分 → 5 分。
+
+2. **流程清晰 (flow_clarity)** — 按主流程步骤数和不清晰步骤数计分：
+   - 满分 20。主流程步骤 ≥3 且不清晰步骤 = 0，给 20 分。
+   - 主流程 ≥3 步且不清晰步骤 ≤1 → 17 分。
+   - 主流程 ≥2 步且不清晰步骤 ≤2 → 14 分。
+   - 主流程 1 步或不清晰步骤 ≥3 → 8 分。
+   - 无主流程 → 5 分。
+
+3. **状态覆盖 (state_coverage)** — 按文档中是否提及各类状态反馈计分：
+   - 满分 20。明确提及空态、加载态、异常态、成功反馈、权限态中 ≥4 种 → 20 分。
+   - 提及 3 种状态 → 15 分。
+   - 提及 2 种状态 → 10 分。
+   - 提及 1 种状态 → 5 分。
+   - 完全未提及任何状态 → 0 分。
+
+4. **规则一致 (rule_consistency)** — 按文档中是否存在规则/文案/行为矛盾计分：
+   - 满分 20。无前后矛盾、文案一致、按钮行为统一 → 20 分。
+   - 有 1 处小矛盾 → 15 分。
+   - 有 2 处矛盾 → 10 分。
+   - 有 ≥3 处矛盾 → 5 分。
+   - 文档未提供任何规则 → 0 分。
+
+计算总分 = completeness + flow_clarity + state_coverage + rule_consistency。
+
+总分等级：
+- 85-100：优秀，可直接进入设计
+- 70-84：良好，有小问题需修正
+- 55-69：及格，有中等问题需确认
+- 40-54：较差，有明显逻辑/流程缺陷
+- 0-39：不合格，需大幅重写`;
 }
 
 function buildUICheckPrompt(files, type) {
@@ -643,20 +1315,20 @@ function buildUICheckPrompt(files, type) {
     prompt += `## 全局优先修改建议\n`;
     prompt += `3-5条最值得先处理的问题，引用上方页面和问题编号。\n\n`;
 
-    prompt += `## 问题表格\n`;
-    prompt += `最后输出一个 JSON 数组，包含所有页面的问题。每个对象包含以下字段：\n`;
-    prompt += `- page: 页面名称（如"首页"）\n`;
-    prompt += `- issue: 问题点简述（10字以内）\n`;
-    prompt += `- location: 问题在页面中的位置描述\n`;
-    prompt += `- severity: 严重程度（high/medium/low）\n`;
-    prompt += `- description: 详细描述问题及影响\n`;
-    prompt += `- suggestion: 修改建议\n`;
-    prompt += `- dev_y: 问题在开发稿中的垂直位置（0=顶部，50=中间，100=底部，估算百分比）\n`;
-    prompt += `- design_y: 问题在设计稿中的垂直位置（同上）\n\n`;
-    prompt += `输出格式：\n`;
+    prompt += `## 问题表格（JSON 格式）\n`;
+    prompt += `最后输出一个 JSON 对象，包含两个数组。严格按以下格式：\n`;
     prompt += `\`\`\`json\n`;
-    prompt += `[{"page": "首页", "issue": "底部操作区缺失", "location": "底部操作区", "severity": "high", "description": "...", "suggestion": "...", "dev_y": 85, "design_y": 82}]\n`;
+    prompt += `{\n`;
+    prompt += `  "confirmed": [\n`;
+    prompt += `    {"page": "首页", "issue": "底部操作区缺失", "location": "底部操作区", "severity": "high", "confidence": "高置信", "description": "设计稿期望...开发稿实际...", "impact": "...", "suggestion": "...", "dev_y": 85, "design_y": 82}\n`;
+    prompt += `  ],\n`;
+    prompt += `  "suspected": [\n`;
+    prompt += `    {"page": "首页", "issue": "收益卡轮廓略偏", "location": "收益卡区域", "suspectLevel": "中疑似", "description": "...", "reason": "...", "basis": "...", "whyNotConfirmed": "...", "impact": "...", "verifySuggestion": "...", "dev_y": 70, "design_y": 68}\n`;
+    prompt += `  ]\n`;
+    prompt += `}\n`;
     prompt += `\`\`\`\n`;
+    prompt += `confirmed 字段：page, issue, location, severity(high/medium/low), confidence(高置信/中置信), description, impact, suggestion, dev_y, design_y\n`;
+    prompt += `suspected 字段：page, issue, location, suspectLevel(高疑似/中疑似/低疑似), description, reason, basis, whyNotConfirmed, impact, verifySuggestion, dev_y, design_y\n`;
 
     return prompt;
   }
@@ -664,11 +1336,13 @@ function buildUICheckPrompt(files, type) {
   // Single page mode — Step 1: analyze design ONLY, output module spec
   const devFile = files.find(f => /dev_screenshot/i.test(f));
   const designFile = files.find(f => /design_mockup/i.test(f));
+  const typeDir = getInputsDir(type);
 
   let prompt = `你是一名资深 UI 设计师。请仔细观察这张**设计稿**图片（设计目标/效果图）。\n\n`;
-  prompt += `图片：designer-platform/inputs/${type}/${designFile}\n`;
+  // Use absolute path for @image reference (codeflicker only supports absolute paths)
+  prompt += `图片：@${path.join(typeDir, designFile)}\n`;
   if (txtFiles.length > 0) {
-    prompt += `背景信息：designer-platform/inputs/${type}/${txtFiles[0]}\n`;
+    prompt += `背景信息：${path.join(typeDir, txtFiles[0])}\n`;
   }
   prompt += `\n从上到下逐一列出页面中的所有模块。\n\n`;
   prompt += `## 输出格式\n`;
@@ -918,10 +1592,8 @@ app.get('/api/figma-check-debug', async (req, res) => {
 
 现在请开始走查。`;
 
-  const claude = spawn('claude', [
-    '--print', fullPrompt,
-    '--permission-mode', 'bypassPermissions',
-    '--output-format', 'text'
+  const claude = spawn('codeflicker', [
+    '-q', '--approval-mode', 'yolo', '--output-format', 'text', fullPrompt
   ], {
     cwd: PARENT_DIR,
     env: { ...process.env }
@@ -1005,10 +1677,8 @@ app.post('/api/figma/design', uploadFigma.array('files', 1), async (req, res) =>
 
 只需输出 JSON 数组，不要其他文字。`;
 
-  const claude = spawn('claude', [
-    '--print', prompt,
-    '--permission-mode', 'bypassPermissions',
-    '--output-format', 'text'
+  const claude = spawn('codeflicker', [
+    '-q', '--approval-mode', 'yolo', '--output-format', 'text', prompt
   ], {
     cwd: PARENT_DIR,
     env: { ...process.env }
@@ -1109,10 +1779,8 @@ ${bgText ? '## 背景信息\n' + bgText + '\n' : ''}
 
 现在请输出 JSON 数组：`;
 
-  const claude = spawn('claude', [
-    '--print', prompt,
-    '--permission-mode', 'bypassPermissions',
-    '--output-format', 'text'
+  const claude = spawn('codeflicker', [
+    '-q', '--approval-mode', 'yolo', '--output-format', 'text', prompt
   ], {
     cwd: PARENT_DIR,
     env: { ...process.env }

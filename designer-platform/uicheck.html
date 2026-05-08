@@ -123,7 +123,7 @@
         </div>
         <div class="loading-step" id="stepAnalyze">
           <span class="step-indicator"></span>
-          <span>Claude Code 分析中</span>
+          <span>CodeFlicker 分析中</span>
         </div>
         <div class="loading-step" id="stepDone">
           <span class="step-indicator"></span>
@@ -531,8 +531,10 @@
 
     // Copy result
     function copyResult() {
-      if (!resultMarkdown) return;
-      navigator.clipboard.writeText(resultMarkdown).then(() => {
+      const el = document.getElementById('resultContent');
+      const text = el.innerText || el.textContent;
+      if (!text) return;
+      navigator.clipboard.writeText(text).then(() => {
         const btn = document.querySelector('.copy-btn');
         btn.textContent = '✓ 已复制';
         btn.classList.add('copied');
@@ -604,7 +606,7 @@
         if (!uploadRes.ok) throw new Error('上传失败');
 
         setLoading(true, 'stepAnalyze');
-        setLoadingText('Claude Code 启动中...');
+        setLoadingText('CodeFlicker 启动中...');
         resultArea.classList.add('visible');
         const eventSource = new EventSource('/api/analyze/uicheck');
 
@@ -615,15 +617,23 @@
             setLoadingText(msg.content);
           } else if (msg.type === 'chunk') {
             resultMarkdown += msg.content;
-            const overviewEnd = resultMarkdown.indexOf('## 问题表格');
-            const displayText = overviewEnd > 0 ? resultMarkdown.substring(0, overviewEnd) : resultMarkdown;
-            resultContent.innerHTML = marked.parse(displayText);
+            // Only show content before the JSON table section
+            const tableStart = resultMarkdown.indexOf('## 问题表格');
+            const displayText = tableStart > 0 ? resultMarkdown.substring(0, tableStart) : resultMarkdown;
+            // Strip all code blocks and raw JSON objects
+            const cleaned = displayText
+              .replace(/```[\s\S]*?```/g, '')
+              .replace(/\{[\s\S]*?"confirmed"[\s\S]*?\}/g, '')
+              .trim();
+            if (cleaned) {
+              resultContent.innerHTML = marked.parse(cleaned);
+            }
             if (resultMarkdown.length > 20) {
               setLoading(false);
               setStepDone('stepAnalyze');
             }
           } else if (msg.type === 'table') {
-            renderIssueTable(msg.rows);
+            renderIssueTable(msg.tableType, msg.rows);
           } else if (msg.type === 'error') {
             errorMsg.textContent = msg.content;
             errorMsg.style.display = 'block';
@@ -638,41 +648,83 @@
           }
         };
 
-        function renderIssueTable(rows) {
+        function renderIssueTable(tableType, rows) {
           if (!rows || rows.length === 0) return;
           const severityColors = { high: '#ef4444', medium: '#f59e0b', low: '#3b82f6' };
-          const severityLabels = { high: '严重', medium: '中等', low: '轻微' };
+          const priorityColorMap = { P0: '#ef4444', P1: '#f59e0b', P2: '#3b82f6' };
+          const suspectLevelColors = { '高疑似': '#f97316', '中疑似': '#eab308', '低疑似': '#94a3b8' };
 
-          let html = '<div class="issue-table-wrapper"><table class="issue-table">';
-          html += '<thead><tr><th style="width:25%">问题点</th><th style="width:37.5%">开发页截图</th><th style="width:37.5%">设计页截图</th></tr></thead>';
-          html += '<tbody>';
+          let html = '';
+          const isConfirmed = tableType === 'confirmed';
+          const title = isConfirmed ? '开发正式问题清单' : '疑似问题 / 待确认项清单';
+          const subtitle = isConfirmed
+            ? '可直接提给前端修改的问题'
+            : '存在偏差迹象，建议设计师进一步复核';
+          const today = new Date().toISOString().slice(0, 10);
+
+          html += `<div class="table-section"><h2 class="table-section-title">${title}</h2>`;
+          html += `<p class="table-section-sub">${subtitle}</p>`;
+          html += '<div class="issue-table-wrapper"><table class="issue-table">';
+          html += '<thead><tr>';
+          html += '<th>序号</th>';
+          html += '<th>问题描述</th>';
+          html += '<th>状态</th>';
+          html += '<th>问题截图</th>';
+          html += '<th>日期</th>';
+          html += '<th>优先级</th>';
+          html += '<th>走查人</th>';
+          html += '<th>跟进人</th>';
+          html += '</tr></thead><tbody>';
 
           const zoomImages = [];
           rows.forEach((row, i) => {
-            const color = severityColors[row.severity] || severityColors.medium;
-            html += `<tr>`;
-            html += `<td>`;
-            html += `<div class="issue-severity" style="background:${color}">${severityLabels[row.severity]}</div>`;
-            html += `<div class="issue-location">${row.location}</div>`;
-            html += `<div class="issue-title">${row.issue}</div>`;
-            html += `<div class="issue-desc">${marked.parse(row.description)}</div>`;
-            html += `<div class="issue-suggestion">💡 ${marked.parse(row.suggestion)}</div>`;
-            html += `</td>`;
-            if (row.devImg) {
-              const idx = zoomImages.length;
-              zoomImages.push(row.devImg);
-              html += `<td class="issue-img-cell"><img src="${row.devImg}" class="zoomable" onclick="window._zoom(${idx})" alt="开发页"><div class="img-hint">点击查看大图</div></td>`;
-            } else {
-              html += `<td class="issue-img-cell"><div class="no-img">未截取到区域</div></td>`;
+            // Support both old (severity) and new (priority) format
+            const priority = row.priority || (row.severity === 'high' ? 'P0' : row.severity === 'low' ? 'P2' : 'P1');
+            const color = isConfirmed
+              ? (priorityColorMap[priority] || priorityColorMap.P1)
+              : (suspectLevelColors[row.suspectLevel] || suspectLevelColors['中疑似']);
+            const status = row.status || (isConfirmed ? '待修改' : '待确认');
+
+            // Description: supports both old (description) and new (problem) format
+            let desc = '';
+            const problemText = row.problem || row.description || '';
+            if (problemText) desc += `<div class="desc-text">${problemText}</div>`;
+            if (row.suggestion) desc += `<div class="desc-text"><strong>建议：</strong>${row.suggestion}</div>`;
+            if (!isConfirmed) {
+              if (row.reason) desc += `<div class="desc-text suspect"><strong>怀疑点：</strong>${row.reason}</div>`;
+              if (row.basis) desc += `<div class="desc-text suspect"><strong>观察依据：</strong>${row.basis}</div>`;
+              if (row.whyNotConfirmed) desc += `<div class="desc-text suspect"><strong>暂不确认原因：</strong>${row.whyNotConfirmed}</div>`;
+              if (row.verifySuggestion) desc += `<div class="desc-text suspect"><strong>确认建议：</strong>${row.verifySuggestion}</div>`;
             }
-            if (row.designImg) {
-              const idx = zoomImages.length;
-              zoomImages.push(row.designImg);
-              html += `<td class="issue-img-cell"><img src="${row.designImg}" class="zoomable" onclick="window._zoom(${idx})" alt="设计页"><div class="img-hint">点击查看大图</div></td>`;
+
+            let screenshotHtml = '';
+            if (row.devImg || row.designImg) {
+              screenshotHtml += '<div class="screenshot-pair">';
+              if (row.devImg) {
+                const idx = zoomImages.length;
+                zoomImages.push(row.devImg);
+                screenshotHtml += `<div class="screenshot-item"><img src="${row.devImg}" class="zoomable" onclick="window._zoom(${idx})" alt="开发页"><span class="screenshot-label">开发页</span></div>`;
+              }
+              if (row.designImg) {
+                const idx = zoomImages.length;
+                zoomImages.push(row.designImg);
+                screenshotHtml += `<div class="screenshot-item"><img src="${row.designImg}" class="zoomable" onclick="window._zoom(${idx})" alt="设计页"><span class="screenshot-label">设计稿</span></div>`;
+              }
+              screenshotHtml += '</div>';
             } else {
-              html += `<td class="issue-img-cell"><div class="no-img">未截取到区域</div></td>`;
+              screenshotHtml = '<div class="no-img">无截图</div>';
             }
-            html += `</tr>`;
+
+            html += '<tr>';
+            html += `<td class="col-seq">${row.id || (i + 1)}</td>`;
+            html += `<td class="col-desc">${desc}</td>`;
+            html += `<td class="col-status">${status}</td>`;
+            html += `<td class="col-screenshot">${screenshotHtml}</td>`;
+            html += `<td class="col-date">${today}</td>`;
+            html += `<td class="col-priority"><span class="priority-badge" style="background:${color};color:#fff">${priority}</span></td>`;
+            html += '<td class="col-reviewer">AI 走查助手</td>';
+            html += '<td class="col-owner">待指定</td>';
+            html += '</tr>';
           });
 
           window._zoomImages = zoomImages;
@@ -681,6 +733,11 @@
         }
 
         eventSource.onerror = (e) => {
+          setLoading(false);
+          if (!errorMsg.textContent) {
+            errorMsg.textContent = '连接分析服务中断，请查看后端日志。';
+            errorMsg.style.display = 'block';
+          }
           eventSource.close();
         };
       } catch (e) {
