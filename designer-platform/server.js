@@ -208,6 +208,40 @@ async function createAnalysisImage(srcPath, suffix) {
   }
 }
 
+function isUICheckImageFile(file) {
+  return /\.(png|jpg|jpeg|webp|bmp|gif)$/i.test(file || '');
+}
+
+function selectSinglePageUICheckFiles(files) {
+  const imageFiles = (files || []).filter(isUICheckImageFile);
+  const exactDev = imageFiles.find(f => /^dev_screenshot\./i.test(f)) || imageFiles.find(f => /dev_screenshot/i.test(f));
+  const exactDesign = imageFiles.find(f => /^design_mockup\./i.test(f)) || imageFiles.find(f => /design_mockup/i.test(f));
+  const devCandidates = imageFiles.filter(f => /^dev[_-]/i.test(f) || /(^|[_-])dev([_-]|\.|$)/i.test(f));
+  const designCandidates = imageFiles.filter(f => /^design[_-]/i.test(f) || /(^|[_-])design([_-]|\.|$)/i.test(f));
+
+  const devFile = exactDev || devCandidates[0] || imageFiles[0] || '';
+  const designFile = exactDesign || designCandidates.find(f => f !== devFile) || imageFiles.find(f => f !== devFile) || '';
+
+  return { devFile, designFile, imageFiles, devCandidates, designCandidates };
+}
+
+async function logImageInfo(label, imgPath) {
+  if (!imgPath) {
+    console.log(`[uicheck image] ${label}: empty path`);
+    return;
+  }
+  if (!fs.existsSync(imgPath)) {
+    console.log(`[uicheck image] ${label}: missing file path=${imgPath}`);
+    return;
+  }
+  try {
+    const [meta, stat] = await Promise.all([sharp(imgPath).metadata(), fs.promises.stat(imgPath)]);
+    console.log(`[uicheck image] ${label}: path=${imgPath} width=${meta.width || 0} height=${meta.height || 0} size=${stat.size}`);
+  } catch (err) {
+    console.log(`[uicheck image] ${label}: metadata error path=${imgPath} error=${err.message}`);
+  }
+}
+
 // Build step 2 analysis prompt for single-page uicheck (issue detection only)
 // Backend reads skill reference files and injects into prompt — model does NOT need to Read
 function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath) {
@@ -851,28 +885,36 @@ app.get('/api/analyze/:type', (req, res) => {
         // Single-page mode: step 1 output is the design spec JSON
         // Now run step 2: compare dev screenshot against the spec
         const designSpec = parseDesignSpecFromOutput(fullTextOutput);
-        const devFile = files.find(f => /dev_screenshot/i.test(f));
+        const { devFile, designFile } = selectSinglePageUICheckFiles(files);
         const bgFile = files.find(f => /background\.txt$/i.test(f));
         const bgPath = bgFile ? path.join(typeDir, bgFile) : '';
         const bgContent = bgPath && fs.existsSync(bgPath)
           ? fs.readFileSync(bgPath, 'utf-8').trim().slice(0, 2000)
           : '';
 
-        if (devFile && designSpec && designSpec.length > 0) {
+        if (devFile && designFile && designSpec && designSpec.length > 0) {
           console.log('[uicheck step 2] design spec modules:', designSpec.length);
           res.write(`data: ${JSON.stringify({ type: 'status', content: '正在对比开发稿...' })}\n\n`);
 
           const devPath = path.join(typeDir, devFile);
-          const designFile = files.find(f => /design_mockup/i.test(f));
           const designFilePath = designFile ? path.join(typeDir, designFile) : '';
+          console.log('[uicheck step 2] files:', files);
+          console.log('[uicheck step 2] devFile:', devFile);
+          console.log('[uicheck step 2] designFile:', designFile);
+          console.log('[uicheck step 2] devPath:', devPath);
+          console.log('[uicheck step 2] designFilePath:', designFilePath);
+          await logImageInfo('step2-dev-original', devPath);
+          await logImageInfo('step2-design-original', designFilePath);
           const analysisDevPath = await createAnalysisImage(devPath, 'dev');
           const analysisDesignPath = designFilePath ? await createAnalysisImage(designFilePath, 'design') : designFilePath;
+          await logImageInfo('step2-dev-analysis', analysisDevPath);
+          await logImageInfo('step2-design-analysis', analysisDesignPath);
           const step2AnalysisPrompt = buildUICheckStep2AnalysisPrompt(designSpec, analysisDevPath, analysisDesignPath, bgContent);
 
-          // Phase A: issue detection only (keep image input lightweight and return final text only)
+          // Phase A: issue detection only (stream-json for raw debug + final text extraction)
           const claude2 = spawn('codeflicker', [
             '-q', '--approval-mode', 'yolo',
-            '--output-format', 'text',
+            '--output-format', 'stream-json',
             step2AnalysisPrompt
           ], {
             cwd: PARENT_DIR,
@@ -905,7 +947,7 @@ app.get('/api/analyze/:type', (req, res) => {
           claude2.on('close', async (code2) => {
             clearTimeout(step2AnalysisTimer);
             const rawOutput = step2RawLines;
-            const analysisOutput = rawOutput.trim();
+            const analysisOutput = extractTextFromStreamJson(step2RawLines).trim();
             fs.writeFileSync('/tmp/codeflicker-uicheck-step2-analysis-raw.txt', rawOutput);
             fs.writeFileSync('/tmp/codeflicker-uicheck-step2-analysis.txt', analysisOutput);
             console.log('[uicheck step2 analysis] closed, code:', code2, 'output length:', analysisOutput.length);
@@ -1260,8 +1302,7 @@ function buildUICheckPrompt(files, type) {
   }
 
   // Single page mode — Step 1: analyze design ONLY, output module spec
-  const devFile = files.find(f => /dev_screenshot/i.test(f));
-  const designFile = files.find(f => /design_mockup/i.test(f));
+  const { designFile } = selectSinglePageUICheckFiles(files);
   const typeDir = getInputsDir(type);
 
   let prompt = `你是一名资深 UI 设计师。请仔细观察这张**设计稿**图片（设计目标/效果图）。\n\n`;
