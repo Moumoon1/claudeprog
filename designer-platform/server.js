@@ -12,18 +12,19 @@ const INPUTS_DIR = path.join(PROJECT_DIR, 'inputs');
 const PARENT_DIR = path.resolve(PROJECT_DIR, '..');
 const UICHECK_RUNTIME_DEBUG_PATH = '/tmp/uicheck-runtime-debug.json';
 const UICHECK_UPLOAD_STATE_PATH = '/tmp/uicheck-latest-upload.json';
+const UICHECK_PROMPT_DEBUG_DIR = '/tmp/uicheck-prompts';
 
 // ── loadSkillContext: read reference files and inject into prompt ──
 const SKILL_DIR = path.join(PARENT_DIR, '.claude/skills/uicheck_pro');
 const REF_DIR = path.join(SKILL_DIR, 'reference');
 
 function loadSkillContext(stage) {
-  // stage: 'analysis' → issue_rules + common_false_positives + review_scope
+  // stage: 'analysis' → issue_rules + common_false_positives + review_scope + output_schema
   // stage: 'screenshot' → screenshot_rules
   const files = [];
   try {
     if (stage === 'analysis') {
-      for (const name of ['issue_rules.md', 'common_false_positives.md', 'review_scope.md']) {
+      for (const name of ['issue_rules.md', 'common_false_positives.md', 'review_scope.md', 'output_schema.md']) {
         const fp = path.join(REF_DIR, name);
         if (fs.existsSync(fp)) files.push({ name, content: fs.readFileSync(fp, 'utf-8') });
       }
@@ -36,6 +37,51 @@ function loadSkillContext(stage) {
   }
   return files;
 }
+
+function writeUICheckPromptDebugFile(stage, prompt) {
+  fs.mkdirSync(UICHECK_PROMPT_DEBUG_DIR, { recursive: true });
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const filePath = path.join(UICHECK_PROMPT_DEBUG_DIR, `${ts}-${stage}.md`);
+  fs.writeFileSync(filePath, prompt, 'utf-8');
+  return filePath;
+}
+
+function resolveUICheckFlow(files, latestUploadState = null) {
+  const requestedMode = latestUploadState?.mode || 'single';
+  const devFiles = files.filter(f => /^dev_/.test(f));
+  const designFiles = files.filter(f => /^design_/.test(f));
+  const hasFolderPairs = devFiles.length > 0 && designFiles.length > 0;
+
+  if (requestedMode === 'folder') {
+    return {
+      mode: 'folder',
+      flowName: 'folder-mode-disabled',
+      flowFunction: 'buildUICheckPrompt(folder-mode)',
+      isFolderMode: true,
+      devFiles,
+      designFiles,
+      reason: 'upload-mode-folder'
+    };
+  }
+
+  return {
+    mode: 'single',
+    flowName: 'single-page-uicheck-pro',
+    flowFunction: 'buildUICheckPrompt(single-page) -> buildUICheckStep2AnalysisPrompt -> executeScreenshotScript',
+    isFolderMode: false,
+    devFiles,
+    designFiles,
+    reason: requestedMode === 'single' ? 'upload-mode-single' : (hasFolderPairs ? 'fallback-force-single' : 'default-single')
+  };
+}
+
+function logUICheckRunMeta(stage, payload) {
+  console.log(`[uicheck ${stage}] flow: ${payload.flowFunction || payload.flowName || ''}`);
+  console.log(`[uicheck ${stage}] prompt file: ${payload.promptFilePath || ''}`);
+  console.log(`[uicheck ${stage}] image refs: ${JSON.stringify(payload.imageRefs || [])}`);
+  console.log(`[uicheck ${stage}] loaded refs: ${JSON.stringify(payload.referenceFiles || [])}`);
+}
+
 
 // Ensure directories exist
 fs.mkdirSync(INPUTS_DIR, { recursive: true });
@@ -836,6 +882,7 @@ app.post('/api/upload/:type', async (req, _res, next) => {
     await writeUICheckLatestUploadState({
       ts: new Date().toISOString(),
       type,
+      mode: req.body.mode || 'single',
       typeDir,
       files: fileNames,
       selection,
@@ -928,54 +975,66 @@ app.get('/api/analyze/:type', async (req, res) => {
   console.log(`[${type}] analyzing files:`, files);
 
   let uicheckStep1Context = null;
+  let uicheckFlow = null;
   if (type === 'uicheck') {
     const latestUploadState = readUICheckLatestUploadState();
-    const devFiles = files.filter(f => /^dev_/.test(f));
-    const designFiles = files.filter(f => /^design_/.test(f));
-    const isFolderMode = devFiles.length > 0 && designFiles.length > 0;
+    uicheckFlow = resolveUICheckFlow(files, latestUploadState);
+    console.log('[uicheck] selected flow:', JSON.stringify(uicheckFlow, null, 2));
 
-    if (!isFolderMode) {
-      const selection = await selectSinglePageUICheckFiles(files, typeDir, latestUploadState);
-      const devFile = selection.devFile;
-      const designFile = selection.designFile;
-      const devPath = devFile ? path.join(typeDir, devFile) : '';
-      const designPath = designFile ? path.join(typeDir, designFile) : '';
-      const devInfo = await logImageInfo('step1-dev-selected', devPath);
-      const designInfo = await logImageInfo('step1-design-selected', designPath);
-
-      console.log('[uicheck step1] files:', files);
-      console.log('[uicheck step1] devFiles:', devFiles);
-      console.log('[uicheck step1] designFiles:', designFiles);
-      console.log('[uicheck step1] selected devFile:', devFile);
-      console.log('[uicheck step1] selected designFile:', designFile);
-      console.log('[uicheck step1] devPath:', devPath);
-      console.log('[uicheck step1] designPath:', designPath);
-
-      uicheckStep1Context = {
-        latestUploadState,
-        selection,
-        devFiles,
-        designFiles,
-        devFile,
-        designFile,
-        devPath,
-        designPath,
-        devInfo,
-        designInfo
-      };
-    } else {
-      console.log('[uicheck step1] files:', files);
-      console.log('[uicheck step1] devFiles:', devFiles);
-      console.log('[uicheck step1] designFiles:', designFiles);
-      uicheckStep1Context = { latestUploadState, devFiles, designFiles, isFolderMode: true };
+    if (uicheckFlow.mode === 'folder') {
+      res.write(`data: ${JSON.stringify({ type: 'error', content: 'uicheck 当前已禁用旧 folder-mode 流程，请切回单页面上传，两张图会走 single-page uicheck_pro 流程。' })}\n\n`);
+      return res.end();
     }
+
+    const selection = await selectSinglePageUICheckFiles(files, typeDir, latestUploadState);
+    const devFile = selection.devFile;
+    const designFile = selection.designFile;
+    const devPath = devFile ? path.join(typeDir, devFile) : '';
+    const designPath = designFile ? path.join(typeDir, designFile) : '';
+    const devInfo = await logImageInfo('step1-dev-selected', devPath);
+    const designInfo = await logImageInfo('step1-design-selected', designPath);
+
+    console.log('[uicheck step1] files:', files);
+    console.log('[uicheck step1] devFiles:', uicheckFlow.devFiles);
+    console.log('[uicheck step1] designFiles:', uicheckFlow.designFiles);
+    console.log('[uicheck step1] selected devFile:', devFile);
+    console.log('[uicheck step1] selected designFile:', designFile);
+    console.log('[uicheck step1] devPath:', devPath);
+    console.log('[uicheck step1] designPath:', designPath);
+
+    uicheckStep1Context = {
+      latestUploadState,
+      flow: uicheckFlow,
+      selection,
+      devFiles: uicheckFlow.devFiles,
+      designFiles: uicheckFlow.designFiles,
+      devFile,
+      designFile,
+      devPath,
+      designPath,
+      devInfo,
+      designInfo
+    };
   }
 
   const prompt = buildPrompt(files, type, uicheckStep1Context);
   if (type === 'uicheck') {
+    const step1PromptPath = writeUICheckPromptDebugFile('step1', prompt);
+    const step1ReferenceFiles = [];
+    const step1BgFile = files.find(f => /background\.txt$/i.test(f));
+    if (step1BgFile) step1ReferenceFiles.push(path.join(typeDir, step1BgFile));
+    logUICheckRunMeta('step1', {
+      flowName: uicheckStep1Context?.flow?.flowName,
+      flowFunction: uicheckStep1Context?.flow?.flowFunction,
+      promptFilePath: step1PromptPath,
+      imageRefs: [uicheckStep1Context?.designPath].filter(Boolean).map(p => '@' + p),
+      referenceFiles: step1ReferenceFiles
+    });
     console.log('[uicheck step1] final prompt:\n' + prompt);
     await appendUICheckRuntimeDebug({
       phase: 'step1-before-model',
+      flow: uicheckStep1Context?.flow || null,
+      promptFilePath: step1PromptPath,
       files,
       devFiles: uicheckStep1Context?.devFiles || [],
       designFiles: uicheckStep1Context?.designFiles || [],
@@ -989,25 +1048,18 @@ app.get('/api/analyze/:type', async (req, res) => {
         dev: uicheckStep1Context?.devInfo || null,
         design: uicheckStep1Context?.designInfo || null
       },
+      referenceFiles: step1ReferenceFiles,
+      imageRefs: [uicheckStep1Context?.designPath].filter(Boolean).map(p => '@' + p),
       prompt
     });
   }
 
   res.write(`data: ${JSON.stringify({ type: 'status', content: 'CodeFlicker 启动中...' })}\n\n`);
 
-  // For uicheck single-page mode: two-step flow to prevent dev/design confusion
-  // Step 1 (already done above): design-only analysis → module spec
-  // Step 2: compare dev screenshot against the text spec
+  // uicheck only keeps the single-page uicheck_pro main flow
   let finalPrompt = prompt;
   if (type === 'uicheck') {
-    const devFiles = files.filter(f => /^dev_/.test(f));
-    const designFilesList = files.filter(f => /^design_/.test(f));
-    const isFolderMode = devFiles.length > 0 && designFilesList.length > 0;
-
-    if (!isFolderMode) {
-      // Single-page mode: step 1 just finished (design analysis), now build step 2
-      res.write(`data: ${JSON.stringify({ type: 'status', content: '正在分析设计稿结构...' })}\n\n`);
-    }
+    res.write(`data: ${JSON.stringify({ type: 'status', content: '正在分析设计稿结构...' })}\n\n`);
   }
 
   // colortry uses interactive mode (needs to run bash for color analysis script)
@@ -1029,11 +1081,7 @@ app.get('/api/analyze/:type', async (req, res) => {
   let fullTextOutput = ''; // extracted text (for stream-json mode)
 
   // For uicheck single-page mode, hide step 1 output from frontend
-  const uicheckSinglePage = type === 'uicheck' && (() => {
-    const df = files.filter(f => /^dev_/.test(f));
-    const dsf = files.filter(f => /^design_/.test(f));
-    return !(df.length > 0 && dsf.length > 0);
-  })();
+  const uicheckSinglePage = type === 'uicheck';
 
   claude.stdout.on('data', (chunk) => {
     const text = chunk.toString();
@@ -1073,172 +1121,186 @@ app.get('/api/analyze/:type', async (req, res) => {
       return;
     }
 
-    // For uicheck: two-step flow for single-page mode
+    // For uicheck: fixed single-page main flow
     if (type === 'uicheck') {
-      const devFiles = files.filter(f => /^dev_/.test(f));
-      const designFilesList = files.filter(f => /^design_/.test(f));
-      const isFolderMode = devFiles.length > 0 && designFilesList.length > 0;
+      const designSpec = parseDesignSpecFromOutput(fullTextOutput);
+      const latestUploadState = readUICheckLatestUploadState();
+      const flow = resolveUICheckFlow(files, latestUploadState);
+      console.log('[uicheck step1] parsed JSON:', JSON.stringify(designSpec, null, 2));
 
-      if (!isFolderMode) {
-        // Single-page mode: step 1 output is the design spec JSON
-        // Now run step 2: compare dev screenshot against the spec
-        const designSpec = parseDesignSpecFromOutput(fullTextOutput);
-        const latestUploadState = readUICheckLatestUploadState();
-        const selection = await selectSinglePageUICheckFiles(files, typeDir, latestUploadState);
-        const devFile = selection.devFile;
-        const designFile = selection.designFile;
-        const bgFile = files.find(f => /background\.txt$/i.test(f));
-        const bgPath = bgFile ? path.join(typeDir, bgFile) : '';
-        const bgContent = bgPath && fs.existsSync(bgPath)
-          ? fs.readFileSync(bgPath, 'utf-8').trim().slice(0, 2000)
-          : '';
+      const selection = await selectSinglePageUICheckFiles(files, typeDir, latestUploadState);
+      const devFile = selection.devFile;
+      const designFile = selection.designFile;
+      const bgFile = files.find(f => /background\.txt$/i.test(f));
+      const bgPath = bgFile ? path.join(typeDir, bgFile) : '';
+      const bgContent = bgPath && fs.existsSync(bgPath)
+        ? fs.readFileSync(bgPath, 'utf-8').trim().slice(0, 2000)
+        : '';
 
-        if (devFile && designFile && designSpec && designSpec.length > 0) {
-          console.log('[uicheck step 2] design spec modules:', designSpec.length);
-          res.write(`data: ${JSON.stringify({ type: 'status', content: '正在对比开发稿...' })}\n\n`);
+      if (devFile && designFile && Array.isArray(designSpec) && designSpec.length > 0) {
+        console.log('[uicheck step 2] design spec modules:', designSpec.length);
+        res.write(`data: ${JSON.stringify({ type: 'status', content: '正在对比开发稿...' })}\n\n`);
 
-          const devPath = path.join(typeDir, devFile);
-          const designFilePath = designFile ? path.join(typeDir, designFile) : '';
-          console.log('[uicheck step 2] files:', files);
-          console.log('[uicheck step 2] devFiles:', selection.devFiles);
-          console.log('[uicheck step 2] designFiles:', selection.designFiles);
-          console.log('[uicheck step 2] devFile:', devFile);
-          console.log('[uicheck step 2] designFile:', designFile);
-          console.log('[uicheck step 2] devPath:', devPath);
-          console.log('[uicheck step 2] designFilePath:', designFilePath);
-          const step2DevInfo = await logImageInfo('step2-dev-original', devPath);
-          const step2DesignInfo = await logImageInfo('step2-design-original', designFilePath);
-          const analysisDevPath = await createAnalysisImage(devPath, 'dev');
-          const analysisDesignPath = designFilePath ? await createAnalysisImage(designFilePath, 'design') : designFilePath;
-          const step2AnalysisDevInfo = await logImageInfo('step2-dev-analysis', analysisDevPath);
-          const step2AnalysisDesignInfo = await logImageInfo('step2-design-analysis', analysisDesignPath);
-          const step2AnalysisPrompt = buildUICheckStep2AnalysisPrompt(designSpec, analysisDevPath, analysisDesignPath, bgContent);
-          console.log('[uicheck step2] final prompt:\n' + step2AnalysisPrompt);
+        const devPath = path.join(typeDir, devFile);
+        const designFilePath = path.join(typeDir, designFile);
+        console.log('[uicheck step 2] files:', files);
+        console.log('[uicheck step 2] devFiles:', selection.devFiles);
+        console.log('[uicheck step 2] designFiles:', selection.designFiles);
+        console.log('[uicheck step 2] devFile:', devFile);
+        console.log('[uicheck step 2] designFile:', designFile);
+        console.log('[uicheck step 2] devPath:', devPath);
+        console.log('[uicheck step 2] designFilePath:', designFilePath);
+        const step2DevInfo = await logImageInfo('step2-dev-original', devPath);
+        const step2DesignInfo = await logImageInfo('step2-design-original', designFilePath);
+        const analysisDevPath = await createAnalysisImage(devPath, 'dev');
+        const analysisDesignPath = await createAnalysisImage(designFilePath, 'design');
+        const step2AnalysisDevInfo = await logImageInfo('step2-dev-analysis', analysisDevPath);
+        const step2AnalysisDesignInfo = await logImageInfo('step2-design-analysis', analysisDesignPath);
+        const step2AnalysisPrompt = buildUICheckStep2AnalysisPrompt(designSpec, analysisDevPath, analysisDesignPath, bgContent);
+        const step2PromptPath = writeUICheckPromptDebugFile('step2-analysis', step2AnalysisPrompt);
+        const step2References = loadSkillContext('analysis').map(f => path.join(REF_DIR, f.name));
+        logUICheckRunMeta('step2', {
+          flowName: flow.flowName,
+          flowFunction: flow.flowFunction,
+          promptFilePath: step2PromptPath,
+          imageRefs: [`@${analysisDevPath}`, `@${analysisDesignPath}`],
+          referenceFiles: step2References
+        });
+        console.log('[uicheck step2] final prompt:\n' + step2AnalysisPrompt);
+        await appendUICheckRuntimeDebug({
+          phase: 'step2-before-model',
+          flow,
+          promptFilePath: step2PromptPath,
+          files,
+          devFiles: selection.devFiles,
+          designFiles: selection.designFiles,
+          selected: {
+            devFile,
+            designFile,
+            devPath,
+            designPath: designFilePath,
+            analysisDevPath,
+            analysisDesignPath
+          },
+          imageInfo: {
+            dev: step2DevInfo,
+            design: step2DesignInfo,
+            analysisDev: step2AnalysisDevInfo,
+            analysisDesign: step2AnalysisDesignInfo
+          },
+          referenceFiles: step2References,
+          imageRefs: [`@${analysisDevPath}`, `@${analysisDesignPath}`],
+          prompt: step2AnalysisPrompt,
+          parsedJson: designSpec
+        });
+
+        // Phase A: issue detection only (stream-json for raw debug + final text extraction)
+        const claude2 = spawn('codeflicker', [
+          '-q', '--approval-mode', 'yolo',
+          '--output-format', 'stream-json',
+          step2AnalysisPrompt
+        ], {
+          cwd: PARENT_DIR,
+          env: { ...process.env }
+        });
+
+        const STEP2_ANALYSIS_TIMEOUT_MS = 8 * 60 * 1000;
+        let step2AnalysisTimedOut = false;
+        const step2AnalysisTimer = setTimeout(() => {
+          step2AnalysisTimedOut = true;
+          console.log('[uicheck step2 analysis] timeout - killing process');
+          claude2.kill('SIGTERM');
+          setTimeout(() => { try { claude2.kill('SIGKILL'); } catch {} }, 3000);
+        }, STEP2_ANALYSIS_TIMEOUT_MS);
+
+        let step2StartTime = Date.now();
+        const heartbeat = setInterval(() => {
+          const elapsed = Math.round((Date.now() - step2StartTime) / 1000);
+          res.write(`data: ${JSON.stringify({ type: 'status', content: `正在对比开发稿...（已运行 ${elapsed} 秒）` })}\n\n`);
+        }, 15000);
+
+        let step2RawLines = '';
+        claude2.stdout.on('data', (chunk) => {
+          step2RawLines += chunk.toString();
+        });
+        claude2.stderr.on('data', (chunk) => {
+          console.log('[uicheck step2 analysis stderr]', chunk.toString().slice(0, 200));
+        });
+
+        claude2.on('close', async (code2) => {
+          clearTimeout(step2AnalysisTimer);
+          const rawOutput = step2RawLines;
+          const analysisOutput = extractTextFromStreamJson(step2RawLines).trim();
+          fs.writeFileSync('/tmp/codeflicker-uicheck-step2-analysis-raw.txt', rawOutput);
+          fs.writeFileSync('/tmp/codeflicker-uicheck-step2-analysis.txt', analysisOutput);
+          console.log('[uicheck step2 analysis] closed, code:', code2, 'output length:', analysisOutput.length);
+
+          if (step2AnalysisTimedOut) {
+            clearInterval(heartbeat);
+            res.write(`data: ${JSON.stringify({ type: 'error', content: '开发稿问题识别超时（8分钟），请查看 /tmp/codeflicker-uicheck-step2-analysis.txt' })}\n\n`);
+            res.end();
+            return;
+          }
+
+          if (code2 !== 0) {
+            clearInterval(heartbeat);
+            const quotaErr2 = /quota|authenticate|403|token-plan/i.test(analysisOutput);
+            const errMsg2 = quotaErr2
+              ? '开发稿对比失败：CodeFlicker 额度或鉴权异常（403/token-plan）。请先恢复可用额度后重试。'
+              : `开发稿对比失败（退出码 ${code2}）。请查看服务端日志和 /tmp/codeflicker-uicheck-step2-analysis.txt`;
+            res.write(`data: ${JSON.stringify({ type: 'error', content: errMsg2 })}\n\n`);
+            res.end();
+            return;
+          }
+
+          const issueData = parseIssuesFromOutput(analysisOutput);
+          console.log('[uicheck step2] parsed JSON:', JSON.stringify(issueData, null, 2));
+          if (!issueData) {
+            clearInterval(heartbeat);
+            res.write(`data: ${JSON.stringify({ type: 'error', content: '开发稿问题识别完成，但未解析到有效 JSON。请查看 /tmp/codeflicker-uicheck-step2-analysis.txt' })}\n\n`);
+            res.end();
+            return;
+          }
+
+          res.write(`data: ${JSON.stringify({ type: 'status', content: '正在生成问题截图...' })}\n\n`);
+
+          // Phase B: Local Python crop + draw box (no codeflicker spawn)
+          // Model outputs CropRegion + Box coordinates in Phase A; Python uses them directly
+          const flatIssues = flattenIssueData(issueData);
+          const screenshotScript = generateScreenshotScript(flatIssues, devPath, designFilePath);
+          try {
+            const scriptResult = await executeScreenshotScript(screenshotScript);
+            console.log('[uicheck step2 screenshot] Python done:', scriptResult.stdout.trim());
+          } catch (screenshotErr) {
+            console.log('[uicheck step2 screenshot] Python error:', screenshotErr.message);
+          }
+
+          const mergedData = attachGeneratedIssueImages(issueData);
+          clearInterval(heartbeat);
+          const mergedJsonStr = '```json\n' + JSON.stringify(mergedData, null, 2) + '\n```';
           await appendUICheckRuntimeDebug({
-            phase: 'step2-before-model',
-            files,
-            devFiles: selection.devFiles,
-            designFiles: selection.designFiles,
-            selected: {
-              devFile,
-              designFile,
-              devPath,
-              designPath: designFilePath,
-              analysisDevPath,
-              analysisDesignPath
-            },
-            imageInfo: {
-              dev: step2DevInfo,
-              design: step2DesignInfo,
-              analysisDev: step2AnalysisDevInfo,
-              analysisDesign: step2AnalysisDesignInfo
-            },
-            prompt: step2AnalysisPrompt
+            phase: 'step2-after-model',
+            flow,
+            parsedJson: issueData,
+            mergedJson: mergedData
           });
-
-          // Phase A: issue detection only (stream-json for raw debug + final text extraction)
-          const claude2 = spawn('codeflicker', [
-            '-q', '--approval-mode', 'yolo',
-            '--output-format', 'stream-json',
-            step2AnalysisPrompt
-          ], {
-            cwd: PARENT_DIR,
-            env: { ...process.env }
-          });
-
-          const STEP2_ANALYSIS_TIMEOUT_MS = 8 * 60 * 1000;
-          let step2AnalysisTimedOut = false;
-          const step2AnalysisTimer = setTimeout(() => {
-            step2AnalysisTimedOut = true;
-            console.log('[uicheck step2 analysis] timeout - killing process');
-            claude2.kill('SIGTERM');
-            setTimeout(() => { try { claude2.kill('SIGKILL'); } catch {} }, 3000);
-          }, STEP2_ANALYSIS_TIMEOUT_MS);
-
-          let step2StartTime = Date.now();
-          const heartbeat = setInterval(() => {
-            const elapsed = Math.round((Date.now() - step2StartTime) / 1000);
-            res.write(`data: ${JSON.stringify({ type: 'status', content: `正在对比开发稿...（已运行 ${elapsed} 秒）` })}\n\n`);
-          }, 15000);
-
-          let step2RawLines = '';
-          claude2.stdout.on('data', (chunk) => {
-            step2RawLines += chunk.toString();
-          });
-          claude2.stderr.on('data', (chunk) => {
-            console.log('[uicheck step2 analysis stderr]', chunk.toString().slice(0, 200));
-          });
-
-          claude2.on('close', async (code2) => {
-            clearTimeout(step2AnalysisTimer);
-            const rawOutput = step2RawLines;
-            const analysisOutput = extractTextFromStreamJson(step2RawLines).trim();
-            fs.writeFileSync('/tmp/codeflicker-uicheck-step2-analysis-raw.txt', rawOutput);
-            fs.writeFileSync('/tmp/codeflicker-uicheck-step2-analysis.txt', analysisOutput);
-            console.log('[uicheck step2 analysis] closed, code:', code2, 'output length:', analysisOutput.length);
-
-            if (step2AnalysisTimedOut) {
-              clearInterval(heartbeat);
-              res.write(`data: ${JSON.stringify({ type: 'error', content: '开发稿问题识别超时（8分钟），请查看 /tmp/codeflicker-uicheck-step2-analysis.txt' })}\n\n`);
-              res.end();
-              return;
-            }
-
-            if (code2 !== 0) {
-              clearInterval(heartbeat);
-              const quotaErr2 = /quota|authenticate|403|token-plan/i.test(analysisOutput);
-              const errMsg2 = quotaErr2
-                ? '开发稿对比失败：CodeFlicker 额度或鉴权异常（403/token-plan）。请先恢复可用额度后重试。'
-                : `开发稿对比失败（退出码 ${code2}）。请查看服务端日志和 /tmp/codeflicker-uicheck-step2-analysis.txt`;
-              res.write(`data: ${JSON.stringify({ type: 'error', content: errMsg2 })}\n\n`);
-              res.end();
-              return;
-            }
-
-            const issueData = parseIssuesFromOutput(analysisOutput);
-            if (!issueData) {
-              clearInterval(heartbeat);
-              res.write(`data: ${JSON.stringify({ type: 'error', content: '开发稿问题识别完成，但未解析到有效 JSON。请查看 /tmp/codeflicker-uicheck-step2-analysis.txt' })}\n\n`);
-              res.end();
-              return;
-            }
-
-            res.write(`data: ${JSON.stringify({ type: 'status', content: '正在生成问题截图...' })}\n\n`);
-
-            // Phase B: Local Python crop + draw box (no codeflicker spawn)
-            // Model outputs CropRegion + Box coordinates in Phase A; Python uses them directly
-            const flatIssues = flattenIssueData(issueData);
-            const screenshotScript = generateScreenshotScript(flatIssues, devPath, designFilePath);
-            try {
-              const scriptResult = await executeScreenshotScript(screenshotScript);
-              console.log('[uicheck step2 screenshot] Python done:', scriptResult.stdout.trim());
-            } catch (screenshotErr) {
-              console.log('[uicheck step2 screenshot] Python error:', screenshotErr.message);
-              // Even if screenshot fails, continue to build table with whatever images exist
-            }
-
-            // Attach generated images to issue data
-            const mergedData = attachGeneratedIssueImages(issueData);
-            clearInterval(heartbeat);
-            const mergedJsonStr = '```json\n' + JSON.stringify(mergedData, null, 2) + '\n```';
-            await generateIssueTable(mergedJsonStr, files, typeDir, isFolderMode, res);
-            res.write(`data: ${JSON.stringify({ type: 'done', code: 0 })}\n\n`);
-            res.end();
-          });
-          claude2.on('error', (err) => {
-            clearTimeout(step2AnalysisTimer);
-            clearInterval(heartbeat);
-            res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`);
-            res.end();
-          });
-          return; // Don't send done yet — step 2 will
-        } else {
-          console.log('[uicheck step 2] missing dev file or empty design spec');
-          res.write(`data: ${JSON.stringify({ type: 'error', content: '设计稿结构解析失败，请检查设计稿是否可读，或查看 /tmp/claude-uicheck-output.txt 排查 Claude 输出。' })}\n\n`);
+          await generateIssueTable(mergedJsonStr, files, typeDir, false, res);
+          res.write(`data: ${JSON.stringify({ type: 'done', code: 0 })}\n\n`);
           res.end();
-          return;
-        }
+        });
+        claude2.on('error', (err) => {
+          clearTimeout(step2AnalysisTimer);
+          clearInterval(heartbeat);
+          res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`);
+          res.end();
+        });
+        return;
       }
+
+      console.log('[uicheck step 2] missing dev file or empty design spec');
+      res.write(`data: ${JSON.stringify({ type: 'error', content: '设计稿结构解析失败，请检查设计稿是否可读，或查看 /tmp/claude-uicheck-output.txt 排查 Claude 输出。' })}\n\n`);
+      res.end();
+      return;
     }
 
     // For lowfi/builder: extract figma plugin code
@@ -1419,134 +1481,29 @@ design_focus 是一个对象，key 为关注点名称，value 为详细说明。
 function buildUICheckPrompt(files, type, uicheckContext = null) {
   const txtFiles = files.filter(f => /background\.txt$/i.test(f));
   const typeDir = getInputsDir(type);
+  const flow = uicheckContext?.flow || resolveUICheckFlow(files, uicheckContext?.latestUploadState || null);
 
-  // Detect folder mode: files start with dev_ and design_ prefixes
-  const devFiles = files.filter(f => /^dev_/.test(f));
-  const designFiles = files.filter(f => /^design_/.test(f));
-  const isFolderMode = devFiles.length > 0 && designFiles.length > 0;
-
-  if (isFolderMode) {
-    // Pair files by common name: dev_首页.png ↔ design_首页.png
-    const pairs = [];
-    for (const devFile of devFiles) {
-      const baseName = devFile.replace(/^dev_/, '');
-      const matchingDesign = designFiles.find(f => f.replace(/^design_/, '') === baseName);
-      if (matchingDesign) {
-        pairs.push({ name: baseName, dev: devFile, design: matchingDesign });
-      }
-    }
-
-    const unpairedDev = devFiles.filter(f => !pairs.some(p => p.dev === f));
-    const unpairedDesign = designFiles.filter(f => !pairs.some(p => p.design === f));
-
-    let prompt = `你是一名资深的设计走查助手，专门用于 APP 页面第一轮走查。\n\n`;
-    prompt += `请按以下步骤执行：\n\n`;
-    prompt += `Step 1：使用 Read 工具读取 .claude/skills/uicheck/SKILL.md，了解走查规则。\n`;
-    prompt += `Step 2：逐一读取以下配对的图片进行走查：\n\n`;
-
-    for (const pair of pairs) {
-      const devAbsPath = path.join(typeDir, pair.dev);
-      const designAbsPath = path.join(typeDir, pair.design);
-      prompt += `【页面：${pair.name}】\n`;
-      prompt += `  - 【开发页】（代码实现产物，文件名 dev_ 开头，图片引用）：@${devAbsPath}\n`;
-      prompt += `  - 【设计稿】（设计目标效果图，文件名 design_ 开头，图片引用）：@${designAbsPath}\n\n`;
-    }
-
-    if (txtFiles.length > 0) {
-      prompt += `  - 背景信息：designer-platform/inputs/${type}/${txtFiles[0]}\n\n`;
-    }
-
-    if (unpairedDev.length > 0) {
-      prompt += `未配对的开发文件（无法对比）：${unpairedDev.join(', ')}\n`;
-    }
-    if (unpairedDesign.length > 0) {
-      prompt += `未配对的设计文件（无法对比）：${unpairedDesign.join(', ')}\n`;
-    }
-    if (unpairedDev.length > 0 || unpairedDesign.length > 0) {
-      prompt += `\n`;
-    }
-
-    prompt += `Step 3：按照 SKILL.md 中的规则对每一个配对页面进行走查分析。\n\n`;
-
-    prompt += `【图片身份铁则】\n`;
-    prompt += `文件名 dev_ 开头的是【开发页】= 代码实现产物\n`;
-    prompt += `文件名 design_ 开头的是【设计稿】= 设计目标\n`;
-    prompt += `两者绝对不能混淆，全程不得交换身份。\n`;
-    prompt += `在分析每个页面时，必须先分别描述开发页和设计稿中可见的关键元素，再进行对比。\n`;
-    prompt += `如果不确定某张图是开发页还是设计稿，查看文件名前缀：dev_ = 开发，design_ = 设计。\n\n`;
-    prompt += `【证据驱动铁则】\n`;
-    prompt += `- 只能基于截图中明确可见的内容进行分析，严禁编造未出现的元素（如Tab、按钮、文案等）\n`;
-    prompt += `- 如果不确定某个元素是否存在，明确说明"从截图中无法确认"\n`;
-    prompt += `- 每个问题都要先确认该元素在开发页和设计稿中分别是什么样子，再描述差异\n`;
-    prompt += `- 描述问题时先说"设计稿中XX是YY样式"，再说"开发稿中XX是ZZ样式"\n\n`;
-    prompt += `【检查重点】—— 请逐项检查，不要遗漏：\n`;
-    prompt += `A. 页面骨架：整体结构是否一致、是否明显缺区块或缺模块\n`;
-    prompt += `B. 模块顺序：从上到下的模块顺序是否基本一致、主模块是否放错位置\n`;
-    prompt += `C. 视觉重点：设计稿中最想强调的内容在开发页是否还是第一重点\n`;
-    prompt += `D. 关键区域样式：顶部导航区、核心卡片区、列表区、关键按钮区、底部操作区是否明显偏差\n`;
-    prompt += `E. 页面节奏：页面是否明显更挤/更散、模块间留白关系是否明显跑偏\n`;
-    prompt += `F. 明显样式偏差：按钮/卡片/标题层级/图标风格/配色重点/圆角背景描边阴影等整体气质不一致\n`;
-    prompt += `G. 操作元素：设计稿中的按钮、输入框、Tab、提示语是否在开发页中存在\n\n`;
-    prompt += `注意：请按 A-G 的顺序逐项检查，每一项都要给出结论。不要跳过任何一项。\n\n`;
-
-    prompt += `【忽略噪音】以下不作为正式问题：长截图起始位置不同、滚动位置不同、截图长度不同、动态数据内容不同、纯文案/文字/数字差异、文案长度不同但结构仍成立、小范围上下偏移、轻微字体渲染差异、极小间距误差。\n`;
-    prompt += `本次走查只看结构和UI还原度，不看文案是否一致。\n\n`;
-
-    prompt += `【输出格式】\n\n`;
-    prompt += `## 多页面走查总览\n`;
-    prompt += `简要总结本次走查的页面总数、整体差异程度、问题集中区域。\n\n`;
-
-    for (const pair of pairs) {
-      prompt += `---\n\n`;
-      prompt += `## 【${pair.name}】走查结果\n\n`;
-      prompt += `### 走查结论\n2-4句话总结该页面的差异程度和问题集中区域。\n\n`;
-      prompt += `### 图片映射\n明确该页面的开发长截图和设计稿长图对应关系。\n\n`;
-      prompt += `### 整体观察\n简要说明页面结构、模块顺序、视觉重点是否一致。\n\n`;
-      prompt += `### 开发问题清单\n按严重程度排序的连续编号问题清单。\n`;
-      prompt += `每条格式：**1. [P1] 问题标题**\n- **位置**：\n- **问题**：\n- **影响**：\n- **建议**：\n\n`;
-      prompt += `### 疑似问题/待确认项\n\n`;
-    }
-
-    prompt += `---\n\n`;
-    prompt += `## 全局优先修改建议\n`;
-    prompt += `3-5条最值得先处理的问题，引用上方页面和问题编号。\n\n`;
-
-    prompt += `## 问题表格（JSON 格式）\n`;
-    prompt += `最后输出一个 JSON 对象，包含两个数组。严格按以下格式：\n`;
-    prompt += `\`\`\`json\n`;
-    prompt += `{\n`;
-    prompt += `  "confirmed": [\n`;
-    prompt += `    {"page": "首页", "issue": "底部操作区缺失", "location": "底部操作区", "severity": "high", "confidence": "高置信", "description": "设计稿期望...开发稿实际...", "impact": "...", "suggestion": "...", "dev_y": 85, "design_y": 82}\n`;
-    prompt += `  ],\n`;
-    prompt += `  "suspected": [\n`;
-    prompt += `    {"page": "首页", "issue": "收益卡轮廓略偏", "location": "收益卡区域", "suspectLevel": "中疑似", "description": "...", "reason": "...", "basis": "...", "whyNotConfirmed": "...", "impact": "...", "verifySuggestion": "...", "dev_y": 70, "design_y": 68}\n`;
-    prompt += `  ]\n`;
-    prompt += `}\n`;
-    prompt += `\`\`\`\n`;
-    prompt += `confirmed 字段：page, issue, location, severity(high/medium/low), confidence(高置信/中置信), description, impact, suggestion, dev_y, design_y\n`;
-    prompt += `suspected 字段：page, issue, location, suspectLevel(高疑似/中疑似/低疑似), description, reason, basis, whyNotConfirmed, impact, verifySuggestion, dev_y, design_y\n`;
-
-    return prompt;
+  if (flow.mode === 'folder') {
+    throw new Error('uicheck folder-mode is disabled for current requests');
   }
 
   // Single page mode — Step 1: analyze design ONLY, output module spec
   const designPathFromContext = uicheckContext?.designPath || '';
   const designFile = files.find(f => /design_mockup/i.test(f)) || files.find(f => /^design[_-]/i.test(f)) || files.find(f => isUICheckImageFile(f));
-  const designPath = designPathFromContext || (designFile ? path.join(typeDir, designFile) : '');
+  const designPath = path.resolve(designPathFromContext || (designFile ? path.join(typeDir, designFile) : ''));
 
   let prompt = `你是一名资深 UI 设计师。请仔细观察这张**设计稿**图片（设计目标/效果图）。\n\n`;
-  // Use absolute path for @image reference (codeflicker only supports absolute paths)
   prompt += `图片：@${designPath}\n`;
   if (txtFiles.length > 0) {
-    prompt += `背景信息：${path.join(typeDir, txtFiles[0])}\n`;
+    prompt += `背景信息文件：${path.resolve(path.join(typeDir, txtFiles[0]))}\n`;
   }
   prompt += `\n从上到下逐一列出页面中的所有模块。\n\n`;
   prompt += `## 输出格式\n`;
   prompt += `只输出 JSON 数组，不要任何文字：\n`;
   prompt += `\`\`\`json\n`;
   prompt += `[\n`;
-  prompt += `  {"order": 1, "name": "顶部导航栏", "content": "返回按钮、页面标题、分享图标", "visual": "白色背景，居中标题18px，左右各一个图标"},\n`;
-  prompt += `  {"order": 2, "name": "Banner区域", "content": "活动标题、倒计时、主按钮", "visual": "渐变紫色背景，圆角卡片"}\n`;
+  prompt += `  {"order": 1, "name": "模块名称1", "content": "模块内容概述", "visual": "视觉特征概述"},\n`;
+  prompt += `  {"order": 2, "name": "模块名称2", "content": "模块内容概述", "visual": "视觉特征概述"}\n`;
   prompt += `]\n`;
   prompt += `\`\`\`\n`;
 
