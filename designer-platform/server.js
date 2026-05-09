@@ -11,6 +11,30 @@ const PROJECT_DIR = path.resolve(__dirname);
 const INPUTS_DIR = path.join(PROJECT_DIR, 'inputs');
 const PARENT_DIR = path.resolve(PROJECT_DIR, '..');
 
+// ── loadSkillContext: read reference files and inject into prompt ──
+const SKILL_DIR = path.join(PARENT_DIR, '.claude/skills/uicheck_pro');
+const REF_DIR = path.join(SKILL_DIR, 'reference');
+
+function loadSkillContext(stage) {
+  // stage: 'analysis' → issue_rules + common_false_positives + review_scope
+  // stage: 'screenshot' → screenshot_rules
+  const files = [];
+  try {
+    if (stage === 'analysis') {
+      for (const name of ['issue_rules.md', 'common_false_positives.md', 'review_scope.md']) {
+        const fp = path.join(REF_DIR, name);
+        if (fs.existsSync(fp)) files.push({ name, content: fs.readFileSync(fp, 'utf-8') });
+      }
+    } else if (stage === 'screenshot') {
+      const fp = path.join(REF_DIR, 'screenshot_rules.md');
+      if (fs.existsSync(fp)) files.push({ name: 'screenshot_rules.md', content: fs.readFileSync(fp, 'utf-8') });
+    }
+  } catch (e) {
+    console.log('[loadSkillContext] error:', e.message);
+  }
+  return files;
+}
+
 // Ensure directories exist
 fs.mkdirSync(INPUTS_DIR, { recursive: true });
 
@@ -157,57 +181,60 @@ function parseDesignSpecFromOutput(text) {
   return null;
 }
 
+async function createAnalysisImage(srcPath, suffix) {
+  if (!srcPath || !fs.existsSync(srcPath)) return srcPath;
+  const outDir = '/tmp/uicheck-analysis';
+  fs.mkdirSync(outDir, { recursive: true });
+  const ext = path.extname(srcPath) || '.png';
+  const base = path.basename(srcPath, path.extname(srcPath));
+  const targetPath = path.join(outDir, `${base}-${suffix}${ext}`);
+  try {
+    const meta = await sharp(srcPath).metadata();
+    const needResize = (meta.width || 0) > 1400 || (meta.height || 0) > 2200;
+    if (!needResize) {
+      fs.copyFileSync(srcPath, targetPath);
+      return targetPath;
+    }
+    await sharp(srcPath)
+      .resize({ width: 1400, height: 2200, fit: 'inside', withoutEnlargement: true })
+      .png()
+      .toFile(targetPath);
+    return targetPath;
+  } catch (err) {
+    console.log('[uicheck analysis image] fallback to original:', err.message);
+    return srcPath;
+  }
+}
+
 // Build step 2 analysis prompt for single-page uicheck (issue detection only)
-// Skill rules are inlined to avoid 3 separate Read tool calls (~45s overhead)
+// Backend reads skill reference files and injects into prompt — model does NOT need to Read
 function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath) {
   const specText = designSpec.map(m =>
-    (m.order || '') + '. ' + (m.name || '') + '：' + (m.content || '') + '，视觉特征：' + (m.visual || '')
+    (m.order || '') + '. ' + String(m.name || '').slice(0, 40) + '：' + String(m.content || '').slice(0, 120) + '，视觉特征：' + String(m.visual || '').slice(0, 80)
   ).join('\n');
 
-  return `你是一个资深的设计走查助手。你收到了一份**设计稿的页面结构清单**、一张**开发稿的截图**和一张**设计稿的截图**。
+  // Load reference files from disk and inline into prompt
+  const skillCtx = loadSkillContext('analysis');
+  let inlineRules = '';
+  for (const f of skillCtx) {
+    inlineRules += `\n### ${f.name}\n${f.content}\n`;
+  }
 
-你的任务：拿着设计稿清单，逐项核对开发稿是否还原到位。只做问题识别，不要调用任何工具（不要 Read，不要 Python）。
+  return `你是一个资深的设计走查助手。请直接完成视觉比对并输出最终 JSON，不要调用任何工具，不要输出解释过程。
+
+## 任务
+基于设计稿结构清单、开发稿截图、设计稿截图，找出明确问题和疑似问题。
+重点检查：模块缺失、结构不一致、关键按钮/标题/图标、遮挡压叠、明显样式错误。
+忽略：动态数据、滚动差异、状态栏、1-2px 级轻微差异。
 
 ## 走查规则（已内嵌，无需额外读取）
+${inlineRules}
 
-### 问题分类
-- **正式问题**：差异明确稳定，不太可能由截图条件造成，可以直接提给开发修改
-  - 模块类型不一致、核心信息结构不一致、对齐关系明显错误
-  - 关键按钮大小/颜色/位置明显不对、核心区域被遮挡/压叠、模块顺序明显错误
-- **疑似问题**：看起来有偏差、对设计质量重要，但暂时不适合直接作为"必须修改"
-  - 波浪曲线疑似更硬、按钮光效疑似过重、背景层次疑似更弱、圆角气质疑似不同、局部留白节奏疑似不同
-- **不纳入**：动态数据/滚动/状态栏/轻微渲染差异
-
-### 检查优先级
-1. 模块缺失 / 顺序错误
-2. 骨架 / 层级 / 对齐问题
-3. 关键组件 / 颖色 / 尺寸
-4. 信息架构错误
-5. 标签 / 图例 / 字段规则错误
-
-### 设计完整性规则
-必须以设计稿为基准逐模块检查：设计稿中每个模块/元素，都必须在开发页确认是否存在。若存在于设计稿但开发页不存在 → 必须输出正式问题。
-
-### 数据排除规则
-以下差异默认不作为问题：
-- 金额、数量、百分比、转化率
-- 日期、时间、用户名、头像、排名、状态
-- 图表数据值、报表数值
-- 数据驱动的图形变化（宽度/高度/面积/曲线）
-- 1-2px 偏移、个别小字体差异、小间距差异
-- 系统差异（状态栏时间、WiFi/电池图标、轻微字体渲染）
-
-对于图表/漏斗：只检查结构、标签、单位、图例、样式/布局/层级；不检查数值一致性和图形形态。
-
-### 问题描述规则
-- 正式问题：只写"问题"+"建议"
-- 疑似问题：只写"问题"+"建议"
-- 不要写成长段小作文，不要在问题描述里重复写位置/优先级/状态
-
-### 图片身份铁则
-- 开发稿 = 代码实现产物（文件名含 dev）
-- 设计稿 = 设计目标效果图（文件名含 design）
-- 两者绝对不能混淆
+### 输出限制
+- 最多输出 8 条问题（confirmed + suspected 合计）
+- 只输出最终 JSON 代码块，不要任何解释文字
+- 坐标使用 0.0-1.0 比例
+- 先识别同一个对象，再分别给 dev/design 坐标，禁止位置投影
 
 ## 设计稿的页面结构清单（设计目标）
 ${specText}
@@ -233,8 +260,10 @@ ${bgPath ? '## 背景信息\n' + bgPath + '\n' : ''}
       "priority": "P0",
       "status": "待修改",
       "location": "问题所在模块/区域",
-      "devRegion": {"top": 0.0, "bottom": 0.15, "left": 0.0, "right": 1.0},
-      "designRegion": {"top": 0.0, "bottom": 0.15, "left": 0.0, "right": 1.0}
+      "devCropRegion": {"top": 0.0, "bottom": 0.15, "left": 0.0, "right": 1.0},
+      "devBox": {"top": 0.02, "bottom": 0.10, "left": 0.1, "right": 0.5},
+      "designCropRegion": {"top": 0.0, "bottom": 0.15, "left": 0.0, "right": 1.0},
+      "designBox": {"top": 0.02, "bottom": 0.10, "left": 0.1, "right": 0.5}
     }
   ],
   "suspected": [
@@ -245,30 +274,28 @@ ${bgPath ? '## 背景信息\n' + bgPath + '\n' : ''}
       "priority": "P2",
       "status": "待确认",
       "location": "疑似所在模块/区域",
-      "devRegion": {"top": 0.15, "bottom": 0.30, "left": 0.0, "right": 1.0},
-      "designRegion": {"top": 0.15, "bottom": 0.30, "left": 0.0, "right": 1.0}
+      "devCropRegion": {"top": 0.15, "bottom": 0.30, "left": 0.0, "right": 1.0},
+      "devBox": {"top": 0.17, "bottom": 0.25, "left": 0.05, "right": 0.4},
+      "designCropRegion": {"top": 0.15, "bottom": 0.30, "left": 0.0, "right": 1.0},
+      "designBox": {"top": 0.17, "bottom": 0.25, "left": 0.05, "right": 0.4}
     }
   ]
 }
-\`\`\`
-
-说明：
-- devRegion / designRegion：相对于图片尺寸的比例，范围 0.0-1.0
-- top/left 是起点，bottom/right 是终点
-- left/right 默认为 0.0-1.0（全宽），若问题只在一小块区域内可缩小（如 0.1-0.9）
-- 如果不确定精确坐标，保守估计稍大一点的区域即可
-
-confirmed：正式问题，id 从 "1" 递增。
-suspected：疑似问题，id 从 "A1" 递增。
-没有某类问题则输出空数组 []。`;
+\`\`\``;
 }
 
 // Generate Python script for cropping and drawing red boxes on screenshots
-// Helper functions for direct Python screenshot (used as fallback)
+// Uses CropRegion (context window for screenshot) and Box (exact element red box) separately
 function generateScreenshotScript(issueData, devPath, designPath) {
   const outputDir = path.join(PARENT_DIR, '.claude/skills/uicheck_pro/outputs');
   
-  // Pass all issue data so Python can read actual devRegion/designRegion
+  // Load screenshot rules from disk and embed as comment for reference
+  const screenshotRules = loadSkillContext('screenshot');
+  let rulesComment = '';
+  for (const f of screenshotRules) {
+    rulesComment += `# --- ${f.name} ---\n# ${f.content.replace(/\n/g, '\n# ')}\n`;
+  }
+
   const script = `import os, json
 from PIL import Image, ImageDraw
 
@@ -282,55 +309,86 @@ design_w, design_h = design_img.size
 issues = ${JSON.stringify(issueData)}
 
 RED = "#ef4444"
-PAD = 15
+PAD_BOX = 8   # padding inside crop for box drawing
+LINE_W = 3    # red box stroke width
 
-def fallbackFromLocation(loc, side, img_h, img_w):
-    """Fallback region estimation from location text if devRegion not provided."""
-    loc = loc.lower()
-    if "banner" in loc or "顶部" in loc or "头" in loc or "主视觉" in loc:
-        return {"top": 0.0, "bottom": 0.30, "left": 0.0, "right": 1.0}
-    elif "cta" in loc or "按钮" in loc or "底部" in loc or "操作" in loc or "footer" in loc:
-        return {"top": 0.75, "bottom": 1.0, "left": 0.0, "right": 1.0}
-    elif "卡片" in loc or "列表" in loc or "规则" in loc or "奖品" in loc or "步骤" in loc or "信息" in loc or "数据" in loc or "产品" in loc:
-        return {"top": 0.25, "bottom": 0.75, "left": 0.0, "right": 1.0}
-    elif "导航" in loc or "nav" in loc or "header" in loc or "tab" in loc:
-        return {"top": 0.0, "bottom": 0.15, "left": 0.0, "right": 1.0}
-    elif "间距" in loc or "留白" in loc or "呼吸" in loc or "圆角" in loc:
-        return {"top": 0.20, "bottom": 0.85, "left": 0.0, "right": 1.0}
-    elif "收益" in loc or "收益率" in loc:
-        return {"top": 0.10, "bottom": 0.30, "left": 0.0, "right": 1.0}
-    elif "参数" in loc or "说明" in loc:
-        return {"top": 0.30, "bottom": 0.60, "left": 0.0, "right": 1.0}
-    else:
-        return {"top": 0.0, "bottom": 1.0, "left": 0.0, "right": 1.0}
+${rulesComment}
 
 for issue in issues:
     id = issue["id"]
-    dev_region = issue.get("devRegion") or fallbackFromLocation(issue.get("location", ""), "dev", dev_h, dev_w)
-    design_region = issue.get("designRegion") or fallbackFromLocation(issue.get("location", ""), "design", design_h, design_w)
     
-    # Dev: convert ratios to pixel coords
-    d_top = int(dev_h * dev_region["top"])
-    d_bottom = int(dev_h * dev_region["bottom"])
-    d_left = int(dev_w * dev_region["left"])
-    d_right = int(dev_w * dev_region["right"])
-    dev_crop = dev_img.crop((d_left, d_top, d_right, d_bottom))
+    # ── CropRegion: larger context window for the screenshot ──
+    dev_crop_r = issue.get("devCropRegion") or issue.get("devRegion") or {"top": 0.0, "bottom": 1.0, "left": 0.0, "right": 1.0}
+    design_crop_r = issue.get("designCropRegion") or issue.get("designRegion") or {"top": 0.0, "bottom": 1.0, "left": 0.0, "right": 1.0}
+    
+    # ── BoxRegion: exact element location for the red box ──
+    # If no separate box, use cropRegion as fallback (means entire crop is the problem area)
+    dev_box_r = issue.get("devBox") or dev_crop_r
+    design_box_r = issue.get("designBox") or design_crop_r
+    
+    # ── Dev screenshot: crop context + draw red box ──
+    dc_top = int(dev_h * dev_crop_r["top"])
+    dc_bottom = int(dev_h * dev_crop_r["bottom"])
+    dc_left = int(dev_w * dev_crop_r["left"])
+    dc_right = int(dev_w * dev_crop_r["right"])
+    dev_crop = dev_img.crop((dc_left, dc_top, dc_right, dc_bottom))
     dev_draw = ImageDraw.Draw(dev_crop)
-    box_w = d_right - d_left
-    box_h = d_bottom - d_top
-    dev_draw.rounded_rectangle([PAD, PAD, box_w - PAD, box_h - PAD], radius=4, outline=RED, width=4)
+    
+    # Box position relative to the cropped image
+    db_top_px = int(dev_h * dev_box_r["top"]) - dc_top
+    db_bottom_px = int(dev_h * dev_box_r["bottom"]) - dc_top
+    db_left_px = int(dev_w * dev_box_r["left"]) - dc_left
+    db_right_px = int(dev_w * dev_box_r["right"]) - dc_left
+    # Clamp to crop bounds
+    db_top_px = max(0, db_top_px)
+    db_left_px = max(0, db_left_px)
+    db_bottom_px = min(dc_bottom - dc_top, db_bottom_px)
+    db_right_px = min(dc_right - dc_left, db_right_px)
+    
+    # Only draw box if it's not the entire crop (i.e., box != cropRegion)
+    if dev_box_r != dev_crop_r:
+        dev_draw.rounded_rectangle(
+            [db_left_px + PAD_BOX, db_top_px + PAD_BOX, db_right_px - PAD_BOX, db_bottom_px - PAD_BOX],
+            radius=4, outline=RED, width=LINE_W
+        )
+    else:
+        # Full-area box: just draw a subtle dashed border around entire crop
+        cw, ch = dc_right - dc_left, dc_bottom - dc_top
+        dev_draw.rounded_rectangle(
+            [4, 4, cw - 4, ch - 4],
+            radius=6, outline="#fca5a5", width=2
+        )
     dev_crop.save("${outputDir}/issue_" + str(id) + "_dev.png")
     
-    # Design: convert ratios to pixel coords
-    ds_top = int(design_h * design_region["top"])
-    ds_bottom = int(design_h * design_region["bottom"])
-    ds_left = int(design_w * design_region["left"])
-    ds_right = int(design_w * design_region["right"])
+    # ── Design screenshot: crop context + draw red box ──
+    ds_top = int(design_h * design_crop_r["top"])
+    ds_bottom = int(design_h * design_crop_r["bottom"])
+    ds_left = int(design_w * design_crop_r["left"])
+    ds_right = int(design_w * design_crop_r["right"])
     design_crop = design_img.crop((ds_left, ds_top, ds_right, ds_bottom))
     design_draw = ImageDraw.Draw(design_crop)
-    box_w = ds_right - ds_left
-    box_h = ds_bottom - ds_top
-    design_draw.rounded_rectangle([PAD, PAD, box_w - PAD, box_h - PAD], radius=4, outline=RED, width=4)
+    
+    # Box position relative to the cropped image
+    dsb_top_px = int(design_h * design_box_r["top"]) - ds_top
+    dsb_bottom_px = int(design_h * design_box_r["bottom"]) - ds_top
+    dsb_left_px = int(design_w * design_box_r["left"]) - ds_left
+    dsb_right_px = int(design_w * design_box_r["right"]) - ds_left
+    dsb_top_px = max(0, dsb_top_px)
+    dsb_left_px = max(0, dsb_left_px)
+    dsb_bottom_px = min(ds_bottom - ds_top, dsb_bottom_px)
+    dsb_right_px = min(ds_right - ds_left, dsb_right_px)
+    
+    if design_box_r != design_crop_r:
+        design_draw.rounded_rectangle(
+            [dsb_left_px + PAD_BOX, dsb_top_px + PAD_BOX, dsb_right_px - PAD_BOX, dsb_bottom_px - PAD_BOX],
+            radius=4, outline=RED, width=LINE_W
+        )
+    else:
+        cw, ch = ds_right - ds_left, ds_bottom - ds_top
+        design_draw.rounded_rectangle(
+            [4, 4, cw - 4, ch - 4],
+            radius=6, outline="#fca5a5", width=2
+        )
     design_crop.save("${outputDir}/issue_" + str(id) + "_design.png")
 
 print("DONE")
@@ -381,71 +439,9 @@ async function executeScreenshotScript(scriptContent) {
 }
 
 
-// Build step 2 screenshot prompt for single-page uicheck
-// Phase B: codeflicker uses Python tool to crop specific elements + draw red boxes per screenshot rules
-function buildUICheckStep2ScreenshotPrompt(issueData, devPath, designPath, bgPath) {
-  return `你是一个资深的设计走查截图助手。现在已确认问题列表，你需要为每条问题在开发稿和设计稿上找到具体问题元素并框出来。
+// [REMOVED] buildUICheckStep2ScreenshotPrompt — Phase B now uses local Python directly
+// No longer spawn codeflicker for screenshots; Node generates Python script and runs it
 
-## 截图规则（必须严格遵守）
-
-### 双图同对象规则
-每个问题必须有开发稿截图 + 设计稿截图，两边框的是同一个问题对象。开发图和设计稿框的不是同一个东西 = 不合格。
-
-### 三类框法
-1. **元素级问题**：框住出问题的具体元素（按钮、标题、图标），框尽量小而准
-2. **模块级问题**：框住整个出问题的模块，两边框的范围要对应
-3. **细节级问题**：框住问题所在的具体细节区域
-
-### 框选要求
-- 只框问题对象本身，不要框过多无关内容
-- 正文说标题问题，截图却框整卡片 = 不合格
-- 只截到了相关区域但没框到问题对象 = 不合格
-
-## 已确认的问题列表
-\`\`\`json
-${JSON.stringify(issueData, null, 2)}
-\`\`\`
-
-## 开发稿截图（代码实现产物）
-图片：@${devPath}
-
-## 设计稿截图（设计目标效果图）
-图片：@${designPath}
-
-${bgPath ? '## 背景信息\n' + bgPath + '\n' : ''}
-
-## 执行要求
-- 不要新增问题，不要删除问题，不要改变 confirmed / suspected 的归类
-- 你只需要根据现有问题列表，为每一条问题分别生成开发稿截图和设计稿截图
-- 必须使用 Python 脚本完成裁图和画框
-- 必须保证开发图和设计稿框住的是同一个问题对象，不能做位置投影
-- 截图要尽量完整，既能看清问题对象，也要保留足够上下文
-- 元素级问题框元素本身；模块级问题框整个模块；细节级问题框对应细节区域
-- 输出目录必须是 .claude/skills/uicheck_pro/outputs/
-- 文件命名必须严格使用 issue_<id>_dev.png 和 issue_<id>_design.png，例如 issue_1_dev.png、issue_A1_design.png
-- 如果某个问题在开发稿找不到对应元素，开发侧框对应模块区域或“未实现”区域
-- 如果你已经生成了截图，也必须在最终 JSON 中回填 images 路径
-
-## 最终输出
-在最后输出一个 JSON 代码块，结构必须与输入问题列表一致，只允许补全 images 字段：
-
-\`\`\`json
-{
-  "confirmed": [
-    {
-      "id": "1",
-      "problem": "...",
-      "suggestion": "...",
-      "priority": "P0",
-      "status": "待修改",
-      "location": "...",
-      "images": [".claude/skills/uicheck_pro/outputs/issue_1_dev.png", ".claude/skills/uicheck_pro/outputs/issue_1_design.png"]
-    }
-  ],
-  "suspected": []
-}
-\`\`\``;
-}
 
 function attachGeneratedIssueImages(issueData) {
   const outputsDir = path.join(PARENT_DIR, '.claude/skills/uicheck_pro/outputs');
@@ -895,8 +891,9 @@ app.get('/api/analyze/:type', (req, res) => {
 
           claude2.on('close', async (code2) => {
             clearTimeout(step2AnalysisTimer);
+            fs.writeFileSync('/tmp/codeflicker-uicheck-step2-analysis-raw.txt', step2RawLines);
 
-            const analysisOutput = extractTextFromStreamJson(step2RawLines) || step2RawLines;
+            const analysisOutput = step2RawLines.trim();
             fs.writeFileSync('/tmp/codeflicker-uicheck-step2-analysis.txt', analysisOutput);
             console.log('[uicheck step2 analysis] closed, code:', code2, 'output length:', analysisOutput.length);
 
@@ -932,106 +929,26 @@ app.get('/api/analyze/:type', (req, res) => {
 
             res.write(`data: ${JSON.stringify({ type: 'status', content: '正在生成问题截图...' })}\n\n`);
 
-            // Phase B: Use codeflicker with Python tool - model reads screenshot rules, sees images, then calls Python to crop specific elements + draw red boxes
-            const screenshotPrompt = buildUICheckStep2ScreenshotPrompt(issueData, devPath, designFilePath, bgPath);
-            const claude3 = spawn('codeflicker', [
-              '-q', '--approval-mode', 'yolo',
-              '--output-format', 'stream-json',
-              screenshotPrompt
-            ], {
-              cwd: PARENT_DIR,
-              env: { ...process.env }
-            });
+            // Phase B: Local Python crop + draw box (no codeflicker spawn)
+            // Model outputs CropRegion + Box coordinates in Phase A; Python uses them directly
+            const flatIssues = flattenIssueData(issueData);
+            const screenshotScript = generateScreenshotScript(flatIssues, devPath, designFilePath);
+            try {
+              const scriptResult = await executeScreenshotScript(screenshotScript);
+              console.log('[uicheck step2 screenshot] Python done:', scriptResult.stdout.trim());
+            } catch (screenshotErr) {
+              console.log('[uicheck step2 screenshot] Python error:', screenshotErr.message);
+              // Even if screenshot fails, continue to build table with whatever images exist
+            }
 
-            const STEP2_SCREENSHOT_TIMEOUT_MS = 12 * 60 * 1000;
-            let step2ScreenshotTimedOut = false;
-            const step2ScreenshotTimer = setTimeout(() => {
-              step2ScreenshotTimedOut = true;
-              console.log('[uicheck step2 screenshot] timeout - killing process');
-              claude3.kill('SIGTERM');
-              setTimeout(() => { try { claude3.kill('SIGKILL'); } catch {} }, 3000);
-            }, STEP2_SCREENSHOT_TIMEOUT_MS);
-
-            let screenshotStartTime = Date.now();
-            const screenshotHeartbeat = setInterval(() => {
-              const elapsed = Math.round((Date.now() - screenshotStartTime) / 1000);
-              res.write(`data: ${JSON.stringify({ type: 'status', content: `正在生成问题截图...（已运行 ${elapsed} 秒）` })}\n\n`);
-            }, 15000);
-
-            let step3RawLines = '';
-            claude3.stdout.on('data', (chunk) => {
-              step3RawLines += chunk.toString();
-            });
-            claude3.stderr.on('data', (chunk) => {
-              console.log('[uicheck step2 screenshot stderr]', chunk.toString().slice(0, 200));
-            });
-
-            claude3.on('close', async (code3) => {
-              clearInterval(heartbeat);
-              clearTimeout(step2ScreenshotTimer);
-              clearInterval(screenshotHeartbeat);
-
-              const screenshotOutput = extractTextFromStreamJson(step3RawLines);
-              fs.writeFileSync('/tmp/codeflicker-uicheck-step2-screenshot.txt', screenshotOutput || step3RawLines);
-              console.log('[uicheck step2 screenshot] closed, code:', code3, 'output length:', screenshotOutput.length);
-
-              if (step2ScreenshotTimedOut) {
-                const mergedData = attachGeneratedIssueImages(issueData);
-                const hasAnyImages = [...(mergedData.confirmed || []), ...(mergedData.suspected || [])].some(issue => issue.images && issue.images.length >= 2);
-                if (hasAnyImages) {
-                  await generateIssueTable(`\`\`\`json\n${JSON.stringify(mergedData, null, 2)}\n\`\`\``, files, typeDir, isFolderMode, res);
-                  res.write(`data: ${JSON.stringify({ type: 'done', code: 0 })}\n\n`);
-                } else {
-                  res.write(`data: ${JSON.stringify({ type: 'error', content: '问题截图生成超时（12分钟），且未找到可用截图。请查看 /tmp/codeflicker-uicheck-step2-screenshot.txt' })}\n\n`);
-                }
-                res.end();
-                return;
-              }
-
-              if (code3 !== 0) {
-                const mergedData = attachGeneratedIssueImages(issueData);
-                const hasAnyImages = [...(mergedData.confirmed || []), ...(mergedData.suspected || [])].some(issue => issue.images && issue.images.length >= 2);
-                if (hasAnyImages) {
-                  await generateIssueTable(`\`\`\`json\n${JSON.stringify(mergedData, null, 2)}\n\`\`\``, files, typeDir, isFolderMode, res);
-                  res.write(`data: ${JSON.stringify({ type: 'done', code: 0 })}\n\n`);
-                } else {
-                  res.write(`data: ${JSON.stringify({ type: 'error', content: `问题截图生成失败（退出码 ${code3}）。请查看 /tmp/codeflicker-uicheck-step2-screenshot.txt` })}\n\n`);
-                }
-                res.end();
-                return;
-              }
-
-              const screenshotParsed = parseIssuesFromOutput(screenshotOutput);
-              const mergedData = attachGeneratedIssueImages(issueData);
-              if (screenshotParsed) {
-                const b2a = new Map();
-                for (const item of (screenshotParsed.confirmed || [])) {
-                  if (item.images && item.images.length >= 2) b2a.set(String(item.id), item.images);
-                }
-                for (const item of (screenshotParsed.suspected || [])) {
-                  if (item.images && item.images.length >= 2) b2a.set(String(item.id), item.images);
-                }
-                const enrich = (items) => items.map(item => {
-                  const bImages = b2a.get(String(item.id));
-                  return { ...item, images: bImages || item.images };
-                });
-                mergedData.confirmed = enrich(mergedData.confirmed || []);
-                mergedData.suspected = enrich(mergedData.suspected || []);
-              }
-              await generateIssueTable(`\`\`\`json\n${JSON.stringify(mergedData, null, 2)}\n\`\`\``, files, typeDir, isFolderMode, res);
-              res.write(`data: ${JSON.stringify({ type: 'done', code: code3 })}\n\n`);
-              res.end();
-            });
-
-            claude3.on('error', (err) => {
-              clearInterval(heartbeat);
-              clearTimeout(step2ScreenshotTimer);
-              clearInterval(screenshotHeartbeat);
-              res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`);
-              res.end();
-            });
+            // Attach generated images to issue data
+            const mergedData = attachGeneratedIssueImages(issueData);
+            clearInterval(heartbeat);
+            const mergedJsonStr = '```json\n' + JSON.stringify(mergedData, null, 2) + '\n```';
+            await generateIssueTable(mergedJsonStr, files, typeDir, isFolderMode, res);
+            res.write(`data: ${JSON.stringify({ type: 'done', code: 0 })}\n\n`);
+            res.end();
           });
-
           claude2.on('error', (err) => {
             clearTimeout(step2AnalysisTimer);
             clearInterval(heartbeat);
