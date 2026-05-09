@@ -142,24 +142,27 @@ async function cropByDevY(imgPath, devY, box) {
 
 // Extract final assistant text from codeflicker stream-json NDJSON output
 function extractTextFromStreamJson(rawLines) {
-  let allText = '';
+  let resultText = '';
+  let assistantText = '';
   const lines = rawLines.split('\n');
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
       const obj = JSON.parse(trimmed);
-      // Collect text from all assistant messages (not just the last one)
+      if (obj?.type === 'result' && typeof obj.content === 'string' && obj.content.trim()) {
+        resultText = obj.content.trim();
+      }
       if (obj.role === 'assistant' && Array.isArray(obj.content)) {
         for (const c of obj.content) {
           if (c.type === 'text' && c.text) {
-            allText += c.text;
+            assistantText += c.text;
           }
         }
       }
     } catch {}
   }
-  return allText;
+  return resultText || assistantText;
 }
 
 // Parse design spec JSON from step 1 output
@@ -185,14 +188,13 @@ async function createAnalysisImage(srcPath, suffix) {
   if (!srcPath || !fs.existsSync(srcPath)) return srcPath;
   const outDir = '/tmp/uicheck-analysis';
   fs.mkdirSync(outDir, { recursive: true });
-  const ext = path.extname(srcPath) || '.png';
   const base = path.basename(srcPath, path.extname(srcPath));
-  const targetPath = path.join(outDir, `${base}-${suffix}${ext}`);
+  const targetPath = path.join(outDir, `${base}-${suffix}.png`);
   try {
     const meta = await sharp(srcPath).metadata();
     const needResize = (meta.width || 0) > 1400 || (meta.height || 0) > 2200;
     if (!needResize) {
-      fs.copyFileSync(srcPath, targetPath);
+      await sharp(srcPath).png().toFile(targetPath);
       return targetPath;
     }
     await sharp(srcPath)
@@ -226,6 +228,12 @@ function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath
 基于设计稿结构清单、开发稿截图、设计稿截图，找出明确问题和疑似问题。
 重点检查：模块缺失、结构不一致、关键按钮/标题/图标、遮挡压叠、明显样式错误。
 忽略：动态数据、滚动差异、状态栏、1-2px 级轻微差异。
+
+## 图片身份铁则
+- 开发稿截图 = 代码实现产物
+- 设计稿截图 = 设计目标效果图
+- 两张图禁止交换身份，先分别识别两张图中的同一对象，再比较差异
+- 只基于这两张图做判断，不要引入其他图片或历史上下文
 
 ## 走查规则（已内嵌，无需额外读取）
 ${inlineRules}
@@ -846,6 +854,9 @@ app.get('/api/analyze/:type', (req, res) => {
         const devFile = files.find(f => /dev_screenshot/i.test(f));
         const bgFile = files.find(f => /background\.txt$/i.test(f));
         const bgPath = bgFile ? path.join(typeDir, bgFile) : '';
+        const bgContent = bgPath && fs.existsSync(bgPath)
+          ? fs.readFileSync(bgPath, 'utf-8').trim().slice(0, 2000)
+          : '';
 
         if (devFile && designSpec && designSpec.length > 0) {
           console.log('[uicheck step 2] design spec modules:', designSpec.length);
@@ -854,12 +865,14 @@ app.get('/api/analyze/:type', (req, res) => {
           const devPath = path.join(typeDir, devFile);
           const designFile = files.find(f => /design_mockup/i.test(f));
           const designFilePath = designFile ? path.join(typeDir, designFile) : '';
-          const step2AnalysisPrompt = buildUICheckStep2AnalysisPrompt(designSpec, devPath, designFilePath, bgPath);
+          const analysisDevPath = await createAnalysisImage(devPath, 'dev');
+          const analysisDesignPath = designFilePath ? await createAnalysisImage(designFilePath, 'design') : designFilePath;
+          const step2AnalysisPrompt = buildUICheckStep2AnalysisPrompt(designSpec, analysisDevPath, analysisDesignPath, bgContent);
 
-          // Phase A: issue detection only (keep Read, no Python) for fast stable completion
+          // Phase A: issue detection only (keep image input lightweight and return final text only)
           const claude2 = spawn('codeflicker', [
             '-q', '--approval-mode', 'yolo',
-            '--output-format', 'stream-json',
+            '--output-format', 'text',
             step2AnalysisPrompt
           ], {
             cwd: PARENT_DIR,
@@ -891,9 +904,9 @@ app.get('/api/analyze/:type', (req, res) => {
 
           claude2.on('close', async (code2) => {
             clearTimeout(step2AnalysisTimer);
-            fs.writeFileSync('/tmp/codeflicker-uicheck-step2-analysis-raw.txt', step2RawLines);
-
-            const analysisOutput = step2RawLines.trim();
+            const rawOutput = step2RawLines;
+            const analysisOutput = rawOutput.trim();
+            fs.writeFileSync('/tmp/codeflicker-uicheck-step2-analysis-raw.txt', rawOutput);
             fs.writeFileSync('/tmp/codeflicker-uicheck-step2-analysis.txt', analysisOutput);
             console.log('[uicheck step2 analysis] closed, code:', code2, 'output length:', analysisOutput.length);
 
@@ -913,10 +926,6 @@ app.get('/api/analyze/:type', (req, res) => {
               res.write(`data: ${JSON.stringify({ type: 'error', content: errMsg2 })}\n\n`);
               res.end();
               return;
-            }
-
-            if (analysisOutput.trim()) {
-              res.write(`data: ${JSON.stringify({ type: 'chunk', content: analysisOutput })}\n\n`);
             }
 
             const issueData = parseIssuesFromOutput(analysisOutput);
