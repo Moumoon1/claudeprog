@@ -10,6 +10,8 @@ const PORT = 3000;
 const PROJECT_DIR = path.resolve(__dirname);
 const INPUTS_DIR = path.join(PROJECT_DIR, 'inputs');
 const PARENT_DIR = path.resolve(PROJECT_DIR, '..');
+const UICHECK_RUNTIME_DEBUG_PATH = '/tmp/uicheck-runtime-debug.json';
+const UICHECK_UPLOAD_STATE_PATH = '/tmp/uicheck-latest-upload.json';
 
 // ── loadSkillContext: read reference files and inject into prompt ──
 const SKILL_DIR = path.join(PARENT_DIR, '.claude/skills/uicheck_pro');
@@ -212,34 +214,127 @@ function isUICheckImageFile(file) {
   return /\.(png|jpg|jpeg|webp|bmp|gif)$/i.test(file || '');
 }
 
-function selectSinglePageUICheckFiles(files) {
+async function selectSinglePageUICheckFiles(files, typeDir, preferState = null) {
   const imageFiles = (files || []).filter(isUICheckImageFile);
-  const exactDev = imageFiles.find(f => /^dev_screenshot\./i.test(f)) || imageFiles.find(f => /dev_screenshot/i.test(f));
-  const exactDesign = imageFiles.find(f => /^design_mockup\./i.test(f)) || imageFiles.find(f => /design_mockup/i.test(f));
-  const devCandidates = imageFiles.filter(f => /^dev[_-]/i.test(f) || /(^|[_-])dev([_-]|\.|$)/i.test(f));
-  const designCandidates = imageFiles.filter(f => /^design[_-]/i.test(f) || /(^|[_-])design([_-]|\.|$)/i.test(f));
+  const withStats = await Promise.all(imageFiles.map(async (file) => {
+    const fullPath = path.join(typeDir, file);
+    try {
+      const stat = await fs.promises.stat(fullPath);
+      return { file, fullPath, mtimeMs: stat.mtimeMs, size: stat.size };
+    } catch {
+      return { file, fullPath, mtimeMs: 0, size: 0 };
+    }
+  }));
 
-  const devFile = exactDev || devCandidates[0] || imageFiles[0] || '';
-  const designFile = exactDesign || designCandidates.find(f => f !== devFile) || imageFiles.find(f => f !== devFile) || '';
+  const sortedDesc = withStats.slice().sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const findByRegexNewest = (regex) => sortedDesc.find(item => regex.test(item.file));
+  const devCandidates = sortedDesc.filter(item => /^dev[_-]/i.test(item.file) || /(^|[_-])dev([_-]|\.|$)/i.test(item.file));
+  const designCandidates = sortedDesc.filter(item => /^design[_-]/i.test(item.file) || /(^|[_-])design([_-]|\.|$)/i.test(item.file));
 
-  return { devFile, designFile, imageFiles, devCandidates, designCandidates };
+  const preferDev = preferState?.devPath ? path.basename(preferState.devPath) : '';
+  const preferDesign = preferState?.designPath ? path.basename(preferState.designPath) : '';
+
+  let devPick = sortedDesc.find(item => item.file === preferDev)
+    || findByRegexNewest(/^dev_screenshot\./i)
+    || findByRegexNewest(/dev_screenshot/i)
+    || devCandidates[0]
+    || sortedDesc[0]
+    || null;
+
+  let designPick = sortedDesc.find(item => item.file === preferDesign)
+    || findByRegexNewest(/^design_mockup\./i)
+    || findByRegexNewest(/design_mockup/i)
+    || designCandidates.find(item => item.file !== (devPick?.file || ''))
+    || sortedDesc.find(item => item.file !== (devPick?.file || ''))
+    || null;
+
+  if (devPick && !designPick) {
+    designPick = sortedDesc.find(item => item.file !== devPick.file) || null;
+  }
+
+  return {
+    devFile: devPick?.file || '',
+    designFile: designPick?.file || '',
+    imageFiles,
+    devFiles: devCandidates.map(item => item.file),
+    designFiles: designCandidates.map(item => item.file),
+    sortedByMtimeDesc: sortedDesc.map(item => ({
+      file: item.file,
+      path: item.fullPath,
+      mtimeMs: item.mtimeMs,
+      size: item.size
+    }))
+  };
+}
+
+async function getImageInfo(imgPath) {
+  if (!imgPath || !fs.existsSync(imgPath)) return null;
+  try {
+    const [meta, stat] = await Promise.all([sharp(imgPath).metadata(), fs.promises.stat(imgPath)]);
+    return {
+      path: imgPath,
+      width: meta.width || 0,
+      height: meta.height || 0,
+      size: stat.size
+    };
+  } catch (err) {
+    return {
+      path: imgPath,
+      width: 0,
+      height: 0,
+      size: 0,
+      error: err.message
+    };
+  }
+}
+
+async function appendUICheckRuntimeDebug(data) {
+  const record = {
+    ts: new Date().toISOString(),
+    ...data
+  };
+  let existing = [];
+  try {
+    if (fs.existsSync(UICHECK_RUNTIME_DEBUG_PATH)) {
+      const raw = fs.readFileSync(UICHECK_RUNTIME_DEBUG_PATH, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) existing = parsed;
+    }
+  } catch {}
+  existing.push(record);
+  if (existing.length > 200) existing = existing.slice(-200);
+  fs.writeFileSync(UICHECK_RUNTIME_DEBUG_PATH, JSON.stringify(existing, null, 2));
+}
+
+async function writeUICheckLatestUploadState(payload) {
+  fs.writeFileSync(UICHECK_UPLOAD_STATE_PATH, JSON.stringify(payload, null, 2));
+}
+
+function readUICheckLatestUploadState() {
+  try {
+    if (!fs.existsSync(UICHECK_UPLOAD_STATE_PATH)) return null;
+    return JSON.parse(fs.readFileSync(UICHECK_UPLOAD_STATE_PATH, 'utf-8'));
+  } catch {
+    return null;
+  }
 }
 
 async function logImageInfo(label, imgPath) {
   if (!imgPath) {
     console.log(`[uicheck image] ${label}: empty path`);
-    return;
+    return null;
   }
   if (!fs.existsSync(imgPath)) {
     console.log(`[uicheck image] ${label}: missing file path=${imgPath}`);
-    return;
+    return null;
   }
-  try {
-    const [meta, stat] = await Promise.all([sharp(imgPath).metadata(), fs.promises.stat(imgPath)]);
-    console.log(`[uicheck image] ${label}: path=${imgPath} width=${meta.width || 0} height=${meta.height || 0} size=${stat.size}`);
-  } catch (err) {
-    console.log(`[uicheck image] ${label}: metadata error path=${imgPath} error=${err.message}`);
+  const info = await getImageInfo(imgPath);
+  if (info?.error) {
+    console.log(`[uicheck image] ${label}: metadata error path=${imgPath} error=${info.error}`);
+  } else {
+    console.log(`[uicheck image] ${label}: path=${imgPath} width=${info?.width || 0} height=${info?.height || 0} size=${info?.size || 0}`);
   }
+  return info;
 }
 
 // Build step 2 analysis prompt for single-page uicheck (issue detection only)
@@ -730,6 +825,44 @@ app.post('/api/upload/:type', async (req, _res, next) => {
 
   newFiles = newFiles.concat(savedImages);
 
+  if (type === 'uicheck') {
+    const fileNames = fs.readdirSync(typeDir);
+    const selection = await selectSinglePageUICheckFiles(fileNames, typeDir, null);
+    const devPath = selection.devFile ? path.join(typeDir, selection.devFile) : '';
+    const designPath = selection.designFile ? path.join(typeDir, selection.designFile) : '';
+    const devInfo = await getImageInfo(devPath);
+    const designInfo = await getImageInfo(designPath);
+
+    await writeUICheckLatestUploadState({
+      ts: new Date().toISOString(),
+      type,
+      typeDir,
+      files: fileNames,
+      selection,
+      devPath,
+      designPath,
+      devInfo,
+      designInfo
+    });
+
+    await appendUICheckRuntimeDebug({
+      phase: 'upload-complete',
+      files: fileNames,
+      devFiles: selection.devFiles,
+      designFiles: selection.designFiles,
+      selected: {
+        devFile: selection.devFile,
+        designFile: selection.designFile,
+        devPath,
+        designPath
+      },
+      imageInfo: {
+        dev: devInfo,
+        design: designInfo
+      }
+    });
+  }
+
   res.json({ ok: true, type, content, persona, taskDesc, files: newFiles, imageCount: savedImages.length });
 });
 
@@ -751,7 +884,7 @@ function cleanPRDImageText(text) {
 }
 
 // Analyze endpoint (SSE streaming)
-app.get('/api/analyze/:type', (req, res) => {
+app.get('/api/analyze/:type', async (req, res) => {
   const { type } = req.params;
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -793,7 +926,72 @@ app.get('/api/analyze/:type', (req, res) => {
   }
 
   console.log(`[${type}] analyzing files:`, files);
-  const prompt = buildPrompt(files, type);
+
+  let uicheckStep1Context = null;
+  if (type === 'uicheck') {
+    const latestUploadState = readUICheckLatestUploadState();
+    const devFiles = files.filter(f => /^dev_/.test(f));
+    const designFiles = files.filter(f => /^design_/.test(f));
+    const isFolderMode = devFiles.length > 0 && designFiles.length > 0;
+
+    if (!isFolderMode) {
+      const selection = await selectSinglePageUICheckFiles(files, typeDir, latestUploadState);
+      const devFile = selection.devFile;
+      const designFile = selection.designFile;
+      const devPath = devFile ? path.join(typeDir, devFile) : '';
+      const designPath = designFile ? path.join(typeDir, designFile) : '';
+      const devInfo = await logImageInfo('step1-dev-selected', devPath);
+      const designInfo = await logImageInfo('step1-design-selected', designPath);
+
+      console.log('[uicheck step1] files:', files);
+      console.log('[uicheck step1] devFiles:', devFiles);
+      console.log('[uicheck step1] designFiles:', designFiles);
+      console.log('[uicheck step1] selected devFile:', devFile);
+      console.log('[uicheck step1] selected designFile:', designFile);
+      console.log('[uicheck step1] devPath:', devPath);
+      console.log('[uicheck step1] designPath:', designPath);
+
+      uicheckStep1Context = {
+        latestUploadState,
+        selection,
+        devFiles,
+        designFiles,
+        devFile,
+        designFile,
+        devPath,
+        designPath,
+        devInfo,
+        designInfo
+      };
+    } else {
+      console.log('[uicheck step1] files:', files);
+      console.log('[uicheck step1] devFiles:', devFiles);
+      console.log('[uicheck step1] designFiles:', designFiles);
+      uicheckStep1Context = { latestUploadState, devFiles, designFiles, isFolderMode: true };
+    }
+  }
+
+  const prompt = buildPrompt(files, type, uicheckStep1Context);
+  if (type === 'uicheck') {
+    console.log('[uicheck step1] final prompt:\n' + prompt);
+    await appendUICheckRuntimeDebug({
+      phase: 'step1-before-model',
+      files,
+      devFiles: uicheckStep1Context?.devFiles || [],
+      designFiles: uicheckStep1Context?.designFiles || [],
+      selected: {
+        devFile: uicheckStep1Context?.devFile || '',
+        designFile: uicheckStep1Context?.designFile || '',
+        devPath: uicheckStep1Context?.devPath || '',
+        designPath: uicheckStep1Context?.designPath || ''
+      },
+      imageInfo: {
+        dev: uicheckStep1Context?.devInfo || null,
+        design: uicheckStep1Context?.designInfo || null
+      },
+      prompt
+    });
+  }
 
   res.write(`data: ${JSON.stringify({ type: 'status', content: 'CodeFlicker 启动中...' })}\n\n`);
 
@@ -885,7 +1083,10 @@ app.get('/api/analyze/:type', (req, res) => {
         // Single-page mode: step 1 output is the design spec JSON
         // Now run step 2: compare dev screenshot against the spec
         const designSpec = parseDesignSpecFromOutput(fullTextOutput);
-        const { devFile, designFile } = selectSinglePageUICheckFiles(files);
+        const latestUploadState = readUICheckLatestUploadState();
+        const selection = await selectSinglePageUICheckFiles(files, typeDir, latestUploadState);
+        const devFile = selection.devFile;
+        const designFile = selection.designFile;
         const bgFile = files.find(f => /background\.txt$/i.test(f));
         const bgPath = bgFile ? path.join(typeDir, bgFile) : '';
         const bgContent = bgPath && fs.existsSync(bgPath)
@@ -899,17 +1100,41 @@ app.get('/api/analyze/:type', (req, res) => {
           const devPath = path.join(typeDir, devFile);
           const designFilePath = designFile ? path.join(typeDir, designFile) : '';
           console.log('[uicheck step 2] files:', files);
+          console.log('[uicheck step 2] devFiles:', selection.devFiles);
+          console.log('[uicheck step 2] designFiles:', selection.designFiles);
           console.log('[uicheck step 2] devFile:', devFile);
           console.log('[uicheck step 2] designFile:', designFile);
           console.log('[uicheck step 2] devPath:', devPath);
           console.log('[uicheck step 2] designFilePath:', designFilePath);
-          await logImageInfo('step2-dev-original', devPath);
-          await logImageInfo('step2-design-original', designFilePath);
+          const step2DevInfo = await logImageInfo('step2-dev-original', devPath);
+          const step2DesignInfo = await logImageInfo('step2-design-original', designFilePath);
           const analysisDevPath = await createAnalysisImage(devPath, 'dev');
           const analysisDesignPath = designFilePath ? await createAnalysisImage(designFilePath, 'design') : designFilePath;
-          await logImageInfo('step2-dev-analysis', analysisDevPath);
-          await logImageInfo('step2-design-analysis', analysisDesignPath);
+          const step2AnalysisDevInfo = await logImageInfo('step2-dev-analysis', analysisDevPath);
+          const step2AnalysisDesignInfo = await logImageInfo('step2-design-analysis', analysisDesignPath);
           const step2AnalysisPrompt = buildUICheckStep2AnalysisPrompt(designSpec, analysisDevPath, analysisDesignPath, bgContent);
+          console.log('[uicheck step2] final prompt:\n' + step2AnalysisPrompt);
+          await appendUICheckRuntimeDebug({
+            phase: 'step2-before-model',
+            files,
+            devFiles: selection.devFiles,
+            designFiles: selection.designFiles,
+            selected: {
+              devFile,
+              designFile,
+              devPath,
+              designPath: designFilePath,
+              analysisDevPath,
+              analysisDesignPath
+            },
+            imageInfo: {
+              dev: step2DevInfo,
+              design: step2DesignInfo,
+              analysisDev: step2AnalysisDevInfo,
+              analysisDesign: step2AnalysisDesignInfo
+            },
+            prompt: step2AnalysisPrompt
+          });
 
           // Phase A: issue detection only (stream-json for raw debug + final text extraction)
           const claude2 = spawn('codeflicker', [
@@ -1191,8 +1416,9 @@ design_focus 是一个对象，key 为关注点名称，value 为详细说明。
 - 0-39：不合格，需大幅重写`;
 }
 
-function buildUICheckPrompt(files, type) {
+function buildUICheckPrompt(files, type, uicheckContext = null) {
   const txtFiles = files.filter(f => /background\.txt$/i.test(f));
+  const typeDir = getInputsDir(type);
 
   // Detect folder mode: files start with dev_ and design_ prefixes
   const devFiles = files.filter(f => /^dev_/.test(f));
@@ -1219,9 +1445,11 @@ function buildUICheckPrompt(files, type) {
     prompt += `Step 2：逐一读取以下配对的图片进行走查：\n\n`;
 
     for (const pair of pairs) {
+      const devAbsPath = path.join(typeDir, pair.dev);
+      const designAbsPath = path.join(typeDir, pair.design);
       prompt += `【页面：${pair.name}】\n`;
-      prompt += `  - 【开发页】（代码实现产物，文件名 dev_ 开头）：designer-platform/inputs/${type}/${pair.dev}\n`;
-      prompt += `  - 【设计稿】（设计目标效果图，文件名 design_ 开头）：designer-platform/inputs/${type}/${pair.design}\n\n`;
+      prompt += `  - 【开发页】（代码实现产物，文件名 dev_ 开头，图片引用）：@${devAbsPath}\n`;
+      prompt += `  - 【设计稿】（设计目标效果图，文件名 design_ 开头，图片引用）：@${designAbsPath}\n\n`;
     }
 
     if (txtFiles.length > 0) {
@@ -1302,12 +1530,13 @@ function buildUICheckPrompt(files, type) {
   }
 
   // Single page mode — Step 1: analyze design ONLY, output module spec
-  const { designFile } = selectSinglePageUICheckFiles(files);
-  const typeDir = getInputsDir(type);
+  const designPathFromContext = uicheckContext?.designPath || '';
+  const designFile = files.find(f => /design_mockup/i.test(f)) || files.find(f => /^design[_-]/i.test(f)) || files.find(f => isUICheckImageFile(f));
+  const designPath = designPathFromContext || (designFile ? path.join(typeDir, designFile) : '');
 
   let prompt = `你是一名资深 UI 设计师。请仔细观察这张**设计稿**图片（设计目标/效果图）。\n\n`;
   // Use absolute path for @image reference (codeflicker only supports absolute paths)
-  prompt += `图片：@${path.join(typeDir, designFile)}\n`;
+  prompt += `图片：@${designPath}\n`;
   if (txtFiles.length > 0) {
     prompt += `背景信息：${path.join(typeDir, txtFiles[0])}\n`;
   }
