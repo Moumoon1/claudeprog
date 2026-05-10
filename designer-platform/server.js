@@ -384,11 +384,19 @@ async function logImageInfo(label, imgPath) {
 }
 
 // Build step 2 analysis prompt for single-page uicheck (issue detection only)
-// Backend reads skill reference files and injects into prompt — model does NOT need to Read
+// Backend reads skill reference files and injects into prompt — model does NOT need to Read skill files
 function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath) {
   const specText = designSpec.map(m =>
     (m.order || '') + '. ' + String(m.name || '').slice(0, 40) + '：' + String(m.content || '').slice(0, 120) + '，视觉特征：' + String(m.visual || '').slice(0, 80)
   ).join('\n');
+
+  const screenshotAssetPaths = [
+    '.claude/skills/uicheck_pro/assets/screenshots/good_pair_annotation.png',
+    '.claude/skills/uicheck_pro/assets/screenshots/good_element_level_box.png',
+    '.claude/skills/uicheck_pro/assets/screenshots/good_module_level_box.png',
+    '.claude/skills/uicheck_pro/assets/screenshots/bad_pair_annotation.png'
+  ];
+  const screenshotAssetSteps = screenshotAssetPaths.map((p, i) => `Step ${i + 3}：使用 Read 工具读取截图规范示例：${p}`).join('\n');
 
   // Load reference files from disk and inline into prompt
   const skillCtx = loadSkillContext('analysis');
@@ -397,74 +405,81 @@ function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath
     inlineRules += `\n### ${f.name}\n${f.content}\n`;
   }
 
-  return `你是一个资深的设计走查助手。请直接完成视觉比对并输出最终 JSON，不要调用任何工具，不要输出解释过程。
+  return `你是一个资深的设计走查助手，负责对比开发稿截图和设计稿截图的视觉差异。
 
-## 任务
-基于设计稿结构清单、开发稿截图、设计稿截图，找出明确问题和疑似问题。
-重点检查：模块缺失、结构不一致、关键按钮/标题/图标、遮挡压叠、明显样式错误。
-忽略：动态数据、滚动差异、状态栏、1-2px 级轻微差异。
+## ⚠️ 必须先完成读图验证（严格执行）
+
+Step 1：使用 Read 工具读取开发稿截图（代码实现产物）：${devPath}
+Step 2：使用 Read 工具读取设计稿截图（设计目标效果图）：${designPath}
+${screenshotAssetSteps}
+Step 7：读取完截图规范示例后，先总结截图规则，再开始读图验证与差异分析。
+
+### 读图验证
+**开发稿（代码实现产物）可见内容：**
+- 页面标题文字（精确引用原图中看到的文字）
+- 从上到下可见的主要模块名称和位置
+- 整体色调和布局特征
+
+**设计稿（设计目标效果图）可见内容：**
+- 页面标题文字（精确引用原图中看到的文字）
+- 从上到下可见的主要模块名称和位置
+- 整体色调和布局特征
+
+**身份确认：**
+- 开发稿和设计稿是否为两张不同图片？（必须回答"是"才能继续）
+- 两张图描述的是同一个页面/同一组模块吗？（必须回答才能继续）
+
+如果验证失败（两张图内容完全无法对应、或无法确认是两张不同图片），输出：
+"读图验证失败：[原因]"，然后停止，不要输出 JSON。
+
+## 截图示例学习要求
+- 上述 assets/screenshots 示例图是截图规范的一部分，必须先读取再分析
+- \`good_pair_annotation.png\` / \`good_element_level_box.png\` / \`good_module_level_box.png\` 用来学习正确框法
+- \`bad_pair_annotation.png\` 用来识别错误框法
+- 产出 \`devCropRegion\`、\`devBox\`、\`designCropRegion\`、\`designBox\` 时，必须与这些示例的规则一致：双图同对象、元素优先匹配、Box 小而准、CropRegion 保留上下文
 
 ## 图片身份铁则
-- 开发稿截图 = 代码实现产物
-- 设计稿截图 = 设计目标效果图
+- 开发稿截图 = 代码实现产物（路径：${devPath}）
+- 设计稿截图 = 设计目标效果图（路径：${designPath}）
 - 两张图禁止交换身份，先分别识别两张图中的同一对象，再比较差异
 - 只基于这两张图做判断，不要引入其他图片或历史上下文
+- 开发稿中的文字/模块名称必须从开发稿图片中实际读取，不要从设计稿推测
+- 设计稿中的文字/模块名称必须从设计稿图片中实际读取，不要从开发稿推测
 
 ## 走查规则（已内嵌，无需额外读取）
 ${inlineRules}
 
 ### 输出限制
 - 最多输出 8 条问题（confirmed + suspected 合计）
-- 只输出最终 JSON 代码块，不要任何解释文字
 - 坐标使用 0.0-1.0 比例
 - 先识别同一个对象，再分别给 dev/design 坐标，禁止位置投影
+- 产出的截图坐标必须参考已读取的 assets 示例，不得框整图、不得框错对象、不得把 design 的位置投影到 dev
+- 每条问题的 problem 必须描述你在两张图中分别看到的具体差异，不允许模糊描述
 
 ## 设计稿的页面结构清单（设计目标）
 ${specText}
 
-## 开发稿截图（代码实现产物）
-图片：@${devPath}
-
-## 设计稿截图（设计目标效果图）
-图片：@${designPath}
-
 ${bgPath ? '## 背景信息\n' + bgPath + '\n' : ''}
 
 ## 最终输出
-**只输出一个 JSON 代码块**，不要输出其他文字：
+
+先输出读图验证文字，然后输出一个 JSON 代码块：
 
 \`\`\`json
 {
-  "confirmed": [
-    {
-      "id": "1",
-      "problem": "一句话问题描述",
-      "suggestion": "一句话修改建议",
-      "priority": "P0",
-      "status": "待修改",
-      "location": "问题所在模块/区域",
-      "devCropRegion": {"top": 0.0, "bottom": 0.15, "left": 0.0, "right": 1.0},
-      "devBox": {"top": 0.02, "bottom": 0.10, "left": 0.1, "right": 0.5},
-      "designCropRegion": {"top": 0.0, "bottom": 0.15, "left": 0.0, "right": 1.0},
-      "designBox": {"top": 0.02, "bottom": 0.10, "left": 0.1, "right": 0.5}
-    }
-  ],
-  "suspected": [
-    {
-      "id": "A1",
-      "problem": "一句话疑似描述",
-      "suggestion": "一句话建议",
-      "priority": "P2",
-      "status": "待确认",
-      "location": "疑似所在模块/区域",
-      "devCropRegion": {"top": 0.15, "bottom": 0.30, "left": 0.0, "right": 1.0},
-      "devBox": {"top": 0.17, "bottom": 0.25, "left": 0.05, "right": 0.4},
-      "designCropRegion": {"top": 0.15, "bottom": 0.30, "left": 0.0, "right": 1.0},
-      "designBox": {"top": 0.17, "bottom": 0.25, "left": 0.05, "right": 0.4}
-    }
-  ]
+  "confirmed": [],
+  "suspected": []
 }
-\`\`\``;
+\`\`\`
+
+confirmed 和 suspected 每条问题必须包含以下字段：
+- id, problem, suggestion, priority(P0/P1/P2), status, location
+- devCropRegion: {top, bottom, left, right}（0.0-1.0比例）
+- devBox: {top, bottom, left, right}（0.0-1.0比例）
+- designCropRegion: {top, bottom, left, right}（0.0-1.0比例）
+- designBox: {top, bottom, left, right}（0.0-1.0比例）
+
+suspected 还需要：reason, basis, whyNotConfirmed, verifySuggestion`;
 }
 
 // Generate Python script for cropping and drawing red boxes on screenshots
@@ -1127,6 +1142,16 @@ app.get('/api/analyze/:type', async (req, res) => {
       const latestUploadState = readUICheckLatestUploadState();
       const flow = resolveUICheckFlow(files, latestUploadState);
       console.log('[uicheck step1] parsed JSON:', JSON.stringify(designSpec, null, 2));
+      console.log('[uicheck step1] verification text:', fullTextOutput.slice(0, 500));
+
+      // Check for Step1 verification failure
+      if (fullTextOutput.includes('读图验证失败')) {
+        const failReason = fullTextOutput.match(/读图验证失败[：:]\s*(.+)/)?.[1] || '未知原因';
+        console.log('[uicheck step1] verification failed:', failReason);
+        res.write(`data: ${JSON.stringify({ type: 'error', content: '设计稿读图验证失败：' + failReason + '。请检查上传的设计稿图片是否正确。' })}\n\n`);
+        res.end();
+        return;
+      }
 
       const selection = await selectSinglePageUICheckFiles(files, typeDir, latestUploadState);
       const devFile = selection.devFile;
@@ -1255,6 +1280,17 @@ app.get('/api/analyze/:type', async (req, res) => {
 
           const issueData = parseIssuesFromOutput(analysisOutput);
           console.log('[uicheck step2] parsed JSON:', JSON.stringify(issueData, null, 2));
+
+          // Check for verification failure in model output
+          if (analysisOutput.includes('读图验证失败')) {
+            clearInterval(heartbeat);
+            const failReason = analysisOutput.match(/读图验证失败[：:]\s*(.+)/)?.[1] || '未知原因';
+            console.log('[uicheck step2] verification failed:', failReason);
+            res.write(`data: ${JSON.stringify({ type: 'error', content: '读图验证失败：' + failReason + '。请检查上传的开发截图和设计稿是否正确。' })}\n\n`);
+            res.end();
+            return;
+          }
+
           if (!issueData) {
             clearInterval(heartbeat);
             res.write(`data: ${JSON.stringify({ type: 'error', content: '开发稿问题识别完成，但未解析到有效 JSON。请查看 /tmp/codeflicker-uicheck-step2-analysis.txt' })}\n\n`);
@@ -1482,6 +1518,12 @@ function buildUICheckPrompt(files, type, uicheckContext = null) {
   const txtFiles = files.filter(f => /background\.txt$/i.test(f));
   const typeDir = getInputsDir(type);
   const flow = uicheckContext?.flow || resolveUICheckFlow(files, uicheckContext?.latestUploadState || null);
+  const screenshotGuideAssets = [
+    '.claude/skills/uicheck_pro/assets/screenshots/good_pair_annotation.png',
+    '.claude/skills/uicheck_pro/assets/screenshots/good_element_level_box.png',
+    '.claude/skills/uicheck_pro/assets/screenshots/good_module_level_box.png',
+    '.claude/skills/uicheck_pro/assets/screenshots/bad_pair_annotation.png'
+  ];
 
   if (flow.mode === 'folder') {
     throw new Error('uicheck folder-mode is disabled for current requests');
@@ -1492,18 +1534,43 @@ function buildUICheckPrompt(files, type, uicheckContext = null) {
   const designFile = files.find(f => /design_mockup/i.test(f)) || files.find(f => /^design[_-]/i.test(f)) || files.find(f => isUICheckImageFile(f));
   const designPath = path.resolve(designPathFromContext || (designFile ? path.join(typeDir, designFile) : ''));
 
-  let prompt = `你是一名资深 UI 设计师。请仔细观察这张**设计稿**图片（设计目标/效果图）。\n\n`;
-  prompt += `图片：@${designPath}\n`;
+  let prompt = `你是一名资深 UI 设计师。你的任务是分析一张**设计稿**图片，从上到下列出页面模块。
+
+## ⚠️ 必须先完成读图验证
+
+请按以下步骤严格执行：
+
+Step 1：使用 Read 工具读取设计稿图片：${designPath}
+Step 2：使用 Read 工具读取截图规范示例（帮助你理解后续框选规则）：
+${screenshotGuideAssets.map(p => `- ${p}`).join('\n')}
+Step 3：读图后，先输出一段**读图验证文字**，格式如下：
+- 图片中可见的标题文字（精确引用）
+- 图片中可见的主要模块名称和位置（从上到下）
+- 图片整体色调和布局特征
+
+Step 4：确认验证文字与图片内容吻合后，再输出模块清单 JSON。
+
+## 截图规范示例要求
+- 必须先读取上述 assets/screenshots 示例图
+- 这些示例图用于学习双图同对象、元素级框选、模块级框选、错误框法
+- 后续 step2 输出坐标时，必须与这些示例的截图规则保持一致
+
+## 禁止事项
+- 禁止在没有读到图片的情况下直接输出 JSON
+- 禁止凭想象编造模块名称和内容
+- 禁止参考任何示例或历史上下文来猜测图片内容
+- 只输出你从图片中实际看到的内容
+
+`;
   if (txtFiles.length > 0) {
-    prompt += `背景信息文件：${path.resolve(path.join(typeDir, txtFiles[0]))}\n`;
+    prompt += `背景信息文件：${path.resolve(path.join(typeDir, txtFiles[0]))}\n\n`;
   }
-  prompt += `\n从上到下逐一列出页面中的所有模块。\n\n`;
   prompt += `## 输出格式\n`;
-  prompt += `只输出 JSON 数组，不要任何文字：\n`;
+  prompt += `先输出读图验证文字，然后输出 JSON 数组（不要任何其他文字）：\n`;
   prompt += `\`\`\`json\n`;
   prompt += `[\n`;
-  prompt += `  {"order": 1, "name": "模块名称1", "content": "模块内容概述", "visual": "视觉特征概述"},\n`;
-  prompt += `  {"order": 2, "name": "模块名称2", "content": "模块内容概述", "visual": "视觉特征概述"}\n`;
+  prompt += `  {"order": 1, "name": "模块名称", "content": "模块内容概述", "visual": "视觉特征概述"},\n`;
+  prompt += `  {"order": 2, "name": "模块名称", "content": "模块内容概述", "visual": "视觉特征概述"}\n`;
   prompt += `]\n`;
   prompt += `\`\`\`\n`;
 

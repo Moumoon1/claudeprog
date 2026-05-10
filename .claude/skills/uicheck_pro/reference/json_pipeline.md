@@ -21,8 +21,8 @@
   "formal_issues": [
     {
       "id": "1",
-      "problem": "开发页收益卡为双信息结构，设计稿为单核心收益结构。",
-      "suggestion": "按设计稿恢复收益卡信息结构与右上内容形式。",
+      "problem": "开发页【某模块】与设计稿在【某项可见差异】上不一致。",
+      "suggestion": "按设计稿恢复【对应模块】的【对应结构或样式】。",
       "priority": "P0",
       "status": "待修改",
       "images": ["outputs/issue_1_dev.png", "outputs/issue_1_design.png"]
@@ -31,8 +31,8 @@
   "suspected_issues": [
     {
       "id": "A1",
-      "problem": "开发页顶部波浪曲线可能比设计稿更生硬。",
-      "suggestion": "建议对该区域做同尺寸局部放大或叠图确认。",
+      "problem": "开发页【某局部细节】可能与设计稿存在差异。",
+      "suggestion": "建议对【对应区域】做同尺寸局部放大或叠图确认。",
       "priority": "P2",
       "status": "待修改",
       "images": ["outputs/issue_A1_dev.png", "outputs/issue_A1_design.png"]
