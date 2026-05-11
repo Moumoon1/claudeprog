@@ -14,12 +14,9 @@ const UICHECK_RUNTIME_DEBUG_PATH = '/tmp/uicheck-runtime-debug.json';
 const UICHECK_UPLOAD_STATE_PATH = '/tmp/uicheck-latest-upload.json';
 const UICHECK_PROMPT_DEBUG_DIR = '/tmp/uicheck-prompts';
 
-// ── loadSkillContext: read uicheck skill files and inject into prompt ──
-const SKILL_DIR_CANDIDATES = [
-  path.join(PARENT_DIR, '.claude/skills/uicheck_pro'),
-  path.join(PARENT_DIR, '.agents/skills/uicheck_pro')
-];
-const SKILL_DIR = SKILL_DIR_CANDIDATES.find(dir => fs.existsSync(dir)) || SKILL_DIR_CANDIDATES[0];
+// ── uicheck skill directory (唯一运行时目录，无 fallback) ──
+const SERVER_VERSION = '2026.05.10-v1';
+const SKILL_DIR = path.join(PARENT_DIR, '.claude/skills/uicheck_pro');
 const SKILL_MD_PATH = path.join(SKILL_DIR, 'SKILL.md');
 const REF_DIR = path.join(SKILL_DIR, 'reference');
 const OUTPUTS_DIR = path.join(SKILL_DIR, 'outputs');
@@ -49,12 +46,13 @@ function toCodeFlickerImageRefs(typeDir, files = []) {
 }
 
 function loadSkillContext(stage) {
-  // stage: 'analysis' → issue_rules + common_false_positives + review_scope + output_schema
+  // stage: 'analysis' → issue_rules + false_positives + output_schema + runtime_guardrails
   // stage: 'screenshot' → screenshot_rules
+  // stage: 'doc' → doc_rules
   const files = [];
   try {
     if (stage === 'analysis') {
-      for (const name of ['issue_rules.md', 'common_false_positives.md', 'review_scope.md', 'output_schema.md']) {
+      for (const name of ['issue_rules.md', 'false_positives.md', 'output_schema.md', 'runtime_guardrails.md']) {
         const fp = path.join(REF_DIR, name);
         const content = readTextFileIfExists(fp);
         if (content) files.push({ name, path: fp, content });
@@ -63,12 +61,25 @@ function loadSkillContext(stage) {
       const fp = path.join(REF_DIR, 'screenshot_rules.md');
       const content = readTextFileIfExists(fp);
       if (content) files.push({ name: 'screenshot_rules.md', path: fp, content });
+    } else if (stage === 'doc') {
+      const fp = path.join(REF_DIR, 'doc_rules.md');
+      const content = readTextFileIfExists(fp);
+      if (content) files.push({ name: 'doc_rules.md', path: fp, content });
     }
   } catch (e) {
     console.log('[loadSkillContext] error:', e.message);
   }
   return files;
 }
+
+// ── 启动时打印关键路径和加载信息 ──
+const loadedRefs = loadSkillContext('analysis');
+console.log(`[uicheck] server version: ${SERVER_VERSION}`);
+console.log(`[uicheck] SKILL_DIR = .claude/skills/uicheck_pro (${SKILL_DIR})`);
+console.log(`[uicheck] SKILL_MD_PATH = ${SKILL_MD_PATH} (exists: ${fs.existsSync(SKILL_MD_PATH)})`);
+console.log(`[uicheck] REF_DIR = ${REF_DIR}`);
+console.log(`[uicheck] analysis reference files loaded: ${loadedRefs.map(f => f.name).join(', ')}`);
+console.log(`[uicheck] OUTPUTS_DIR = ${OUTPUTS_DIR} (exists: ${fs.existsSync(OUTPUTS_DIR)})`);
 
 function writeUICheckPromptDebugFile(stage, prompt) {
   fs.mkdirSync(UICHECK_PROMPT_DEBUG_DIR, { recursive: true });
@@ -422,9 +433,6 @@ function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath
     (m.order || '') + '. ' + String(m.name || '').slice(0, 40) + '：' + String(m.content || '').slice(0, 120) + '，视觉特征：' + String(m.visual || '').slice(0, 80)
   ).join('\n');
 
-  const screenshotAssetPaths = SCREENSHOT_GUIDE_ASSET_PATHS.map(p => path.resolve(p));
-  const screenshotAssetSteps = screenshotAssetPaths.map((p, i) => `Step ${i + 3}：读取截图规范示例：${toCodeFlickerFileRef(p)}`).join('\n');
-
   const skillMarkdown = loadUICheckSkillMarkdown();
   const skillCtx = loadSkillContext('analysis');
   const inlineSkill = skillMarkdown ? `\n## uicheck_pro SKILL.md（已内嵌，无需额外读取）\n${skillMarkdown}\n` : '';
@@ -439,8 +447,8 @@ function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath
 
 Step 1：读取开发稿截图（代码实现产物）：${toCodeFlickerFileRef(devPath)}
 Step 2：读取设计稿截图（设计目标效果图）：${toCodeFlickerFileRef(designPath)}
-${screenshotAssetSteps}
-Step 7：读取完截图规范示例后，先总结截图规则，再开始读图验证与差异分析。
+
+**读不到任何一张真实图就立即停止，输出"读图验证失败：[原因]"，不要继续分析或输出 JSON。**
 
 ### 读图验证
 **开发稿（代码实现产物）可见内容：**
@@ -460,12 +468,6 @@ Step 7：读取完截图规范示例后，先总结截图规则，再开始读�
 如果验证失败（两张图内容完全无法对应、或无法确认是两张不同图片），输出：
 "读图验证失败：[原因]"，然后停止，不要输出 JSON。
 
-## 截图示例学习要求
-- 上述 assets/screenshots 示例图是截图规范的一部分，必须先读取再分析
-- \`good_pair_annotation.png\` / \`good_element_level_box.png\` / \`good_module_level_box.png\` 用来学习正确框法
-- \`bad_pair_annotation.png\` 用来识别错误框法
-- 产出 \`devCropRegion\`、\`devBox\`、\`designCropRegion\`、\`designBox\` 时，必须与这些示例的规则一致：双图同对象、元素优先匹配、Box 小而准、CropRegion 保留上下文
-
 ## 图片身份铁则
 - 开发稿截图 = 代码实现产物（路径：${devPath}）
 - 设计稿截图 = 设计目标效果图（路径：${designPath}）
@@ -483,7 +485,7 @@ ${inlineRules}
 - 最多输出 8 条问题（confirmed + suspected 合计）
 - 坐标使用 0.0-1.0 比例
 - 先识别同一个对象，再分别给 dev/design 坐标，禁止位置投影
-- 产出的截图坐标必须参考已读取的 assets 示例，不得框整图、不得框错对象、不得把 design 的位置投影到 dev
+- 不得框整图、不得框错对象、不得把 design 的位置投影到 dev
 - 每条问题的 problem 必须描述你在两张图中分别看到的具体差异，不允许模糊描述
 
 ## 设计稿的页面结构清单（设计目标）
@@ -1549,8 +1551,6 @@ function buildUICheckPrompt(files, type, uicheckContext = null) {
   const txtFiles = files.filter(f => /background\.txt$/i.test(f));
   const typeDir = getInputsDir(type);
   const flow = uicheckContext?.flow || resolveUICheckFlow(files, uicheckContext?.latestUploadState || null);
-  const screenshotGuideAssets = SCREENSHOT_GUIDE_ASSET_PATHS.map(p => path.resolve(p));
-  const screenshotGuideAssetRefs = screenshotGuideAssets.map(p => toCodeFlickerFileRef(p));
 
   if (flow.mode === 'folder') {
     throw new Error('uicheck folder-mode is disabled for current requests');
@@ -1573,19 +1573,14 @@ function buildUICheckPrompt(files, type, uicheckContext = null) {
 请按以下步骤严格执行：
 
 Step 1：读取设计稿图片：${toCodeFlickerFileRef(designPath)}
-Step 2：读取截图规范示例（帮助你理解后续框选规则）：
-${screenshotGuideAssetRefs.map(p => `- ${p}`).join('\n')}
-Step 3：读图后，先输出一段**读图验证文字**，格式如下：
+Step 2：读图后，先输出一段**读图验证文字**，格式如下：
 - 图片中可见的标题文字（精确引用）
 - 图片中可见的主要模块名称和位置（从上到下）
 - 图片整体色调和布局特征
 
-Step 4：确认验证文字与图片内容吻合后，再输出模块清单 JSON。
+**读不到真实设计稿图片就立即停止，输出"读图验证失败"，不要继续输出 JSON。**
 
-## 截图规范示例要求
-- 必须先读取上述 assets/screenshots 示例图
-- 这些示例图用于学习双图同对象、元素级框选、模块级框选、错误框法
-- 后续 step2 输出坐标时，必须与这些示例的截图规则保持一致
+Step 3：确认验证文字与图片内容吻合后，再输出模块清单 JSON。
 
 ## 禁止事项
 - 禁止在没有读到图片的情况下直接输出 JSON
