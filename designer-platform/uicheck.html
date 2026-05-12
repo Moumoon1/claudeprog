@@ -103,6 +103,37 @@
       <textarea id="bgInfo" rows="3" placeholder="补充走查背景，例如：本次重点检查首页改版，关注顶部导航和底部 CTA 按钮的还原度..."></textarea>
     </div>
 
+    <!-- 模型选择 -->
+    <div class="section">
+      <h3>&#129302; 视觉模型</h3>
+      <div class="model-dropdown" id="modelDropdown">
+        <div class="model-dropdown-trigger" id="modelTrigger" onclick="toggleModelDropdown()">
+          <span class="model-dropdown-label" id="modelLabel">Kimi K2.5（推荐）</span>
+          <svg class="model-dropdown-arrow" id="modelArrow" viewBox="0 0 12 12" width="14" height="14"><path d="M3 4.5L6 7.5L9 4.5" stroke="#6366f1" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div class="model-dropdown-menu" id="modelMenu">
+          <div class="model-dropdown-item selected" data-value="kimi-k2.5" onclick="selectModel('kimi-k2.5', 'Kimi K2.5（推荐）')">
+            <span class="model-item-name">Kimi K2.5</span>
+            <span class="model-item-tag recommended">推荐</span>
+          </div>
+          <div class="model-dropdown-item" data-value="claude" onclick="selectModel('claude', 'Claude Sonnet 4.6')">
+            <span class="model-item-name">Claude Sonnet 4.6</span>
+            <span class="model-item-tag limited">额度受限</span>
+          </div>
+          <div class="model-dropdown-item" data-value="5" onclick="selectModel('5', 'GPT 5.4')">
+            <span class="model-item-name">GPT 5.4</span>
+            <span class="model-item-tag limited">额度受限</span>
+          </div>
+          <div class="model-dropdown-item" data-value="gemini" onclick="selectModel('gemini', 'Gemini 3.1 Pro')">
+            <span class="model-item-name">Gemini 3.1 Pro</span>
+            <span class="model-item-tag limited">额度受限</span>
+          </div>
+        </div>
+        <input type="hidden" id="visionModel" value="kimi-k2.5">
+      </div>
+      <p class="model-note">选择用于读图的视觉模型。不同模型额度独立，如遇额度上限会自动提示。</p>
+    </div>
+
     <button class="submit-btn" id="submitBtn" onclick="startReview()">
       <span class="spinner"></span>
       <span class="btn-text">开始走查</span>
@@ -145,6 +176,98 @@
   </div>
 
   <style>
+    /* Custom model dropdown */
+    .model-dropdown {
+      position: relative;
+      user-select: none;
+    }
+    .model-dropdown-trigger {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      background: #fff;
+      border: 1px solid #e5e5e5;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      min-height: 42px;
+    }
+    .model-dropdown-trigger:hover {
+      border-color: #d1d5db;
+    }
+    .model-dropdown-trigger.open {
+      border-color: #6366f1;
+      box-shadow: 0 0 0 3px rgba(99,102,241,0.1);
+      border-radius: 8px 8px 0 0;
+    }
+    .model-dropdown-label {
+      font-size: 14px;
+      color: #1e293b;
+      font-family: 'Inter', sans-serif;
+    }
+    .model-dropdown-arrow {
+      flex-shrink: 0;
+      transition: transform 0.2s;
+    }
+    .model-dropdown-trigger.open .model-dropdown-arrow {
+      transform: rotate(180deg);
+    }
+    .model-dropdown-menu {
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      background: #fff;
+      border: 1px solid #6366f1;
+      border-top: none;
+      border-radius: 0 0 8px 8px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+      z-index: 10;
+      display: none;
+      overflow: hidden;
+    }
+    .model-dropdown-menu.show {
+      display: block;
+    }
+    .model-dropdown-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .model-dropdown-item:hover {
+      background: #f5f3ff;
+    }
+    .model-dropdown-item.selected {
+      background: #f5f3ff;
+    }
+    .model-item-name {
+      font-size: 14px;
+      color: #1e293b;
+    }
+    .model-item-tag {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 100px;
+      font-weight: 500;
+    }
+    .model-item-tag.recommended {
+      background: #ede9fe;
+      color: #6366f1;
+    }
+    .model-item-tag.limited {
+      background: #fef3c7;
+      color: #92400e;
+    }
+    .model-note {
+      font-size: 12px;
+      color: #94a3b8;
+      margin-top: 8px;
+      line-height: 1.5;
+    }
     .copy-btn {
       padding: 6px 14px;
       border: 1px solid #e5e5e5;
@@ -371,6 +494,30 @@
     // Tab state
     let currentTab = 'single';
     const folderFiles = { dev: [], design: [] };
+
+    // Custom model dropdown
+    function toggleModelDropdown() {
+      const trigger = document.getElementById('modelTrigger');
+      const menu = document.getElementById('modelMenu');
+      const isOpen = trigger.classList.contains('open');
+      trigger.classList.toggle('open');
+      menu.classList.toggle('show');
+    }
+    function selectModel(value, label) {
+      document.getElementById('visionModel').value = value;
+      document.getElementById('modelLabel').textContent = label;
+      document.querySelectorAll('.model-dropdown-item').forEach(item => {
+        item.classList.toggle('selected', item.dataset.value === value);
+      });
+      toggleModelDropdown();
+    }
+    document.addEventListener('click', (e) => {
+      const dropdown = document.getElementById('modelDropdown');
+      if (!dropdown.contains(e.target)) {
+        document.getElementById('modelTrigger').classList.remove('open');
+        document.getElementById('modelMenu').classList.remove('show');
+      }
+    });
 
     function switchTab(tab) {
       currentTab = tab;
@@ -608,7 +755,8 @@
         setLoading(true, 'stepAnalyze');
         setLoadingText('CodeFlicker 启动中...');
         resultArea.classList.add('visible');
-        const eventSource = new EventSource('/api/analyze/uicheck');
+        const visionModel = document.getElementById('visionModel').value;
+        const eventSource = new EventSource('/api/analyze/uicheck?model=' + encodeURIComponent(visionModel));
 
         eventSource.onmessage = (e) => {
           const msg = JSON.parse(e.data);

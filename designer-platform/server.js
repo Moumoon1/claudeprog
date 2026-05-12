@@ -13,10 +13,11 @@ const PARENT_DIR = path.resolve(PROJECT_DIR, '..');
 const UICHECK_RUNTIME_DEBUG_PATH = '/tmp/uicheck-runtime-debug.json';
 const UICHECK_UPLOAD_STATE_PATH = '/tmp/uicheck-latest-upload.json';
 const UICHECK_PROMPT_DEBUG_DIR = '/tmp/uicheck-prompts';
+const UICHECK_ANALYSIS_IMAGES_DIR = path.join(PROJECT_DIR, 'runtime_images');
 
 // ── uicheck skill directory (唯一运行时目录，无 fallback) ──
 const SERVER_VERSION = '2026.05.10-v1';
-const SKILL_DIR = path.join(PARENT_DIR, '.claude/skills/uicheck_pro');
+const SKILL_DIR = path.join(PARENT_DIR, '.codeflicker/skills/uicheck_pro');
 const SKILL_MD_PATH = path.join(SKILL_DIR, 'SKILL.md');
 const REF_DIR = path.join(SKILL_DIR, 'reference');
 const OUTPUTS_DIR = path.join(SKILL_DIR, 'outputs');
@@ -75,7 +76,7 @@ function loadSkillContext(stage) {
 // ── 启动时打印关键路径和加载信息 ──
 const loadedRefs = loadSkillContext('analysis');
 console.log(`[uicheck] server version: ${SERVER_VERSION}`);
-console.log(`[uicheck] SKILL_DIR = .claude/skills/uicheck_pro (${SKILL_DIR})`);
+console.log(`[uicheck] SKILL_DIR = .codeflicker/skills/uicheck_pro (${SKILL_DIR})`);
 console.log(`[uicheck] SKILL_MD_PATH = ${SKILL_MD_PATH} (exists: ${fs.existsSync(SKILL_MD_PATH)})`);
 console.log(`[uicheck] REF_DIR = ${REF_DIR}`);
 console.log(`[uicheck] analysis reference files loaded: ${loadedRefs.map(f => f.name).join(', ')}`);
@@ -128,6 +129,7 @@ function logUICheckRunMeta(stage, payload) {
 
 // Ensure directories exist
 fs.mkdirSync(INPUTS_DIR, { recursive: true });
+fs.mkdirSync(UICHECK_ANALYSIS_IMAGES_DIR, { recursive: true });
 
 // Each upload type gets its own sub-directory to prevent cross-contamination
 function getInputsDir(type) {
@@ -136,7 +138,7 @@ function getInputsDir(type) {
   return dir;
 }
 
-// Parse JSON from Claude's text output
+// Parse JSON from FlickCLI's text output
 function parseIssuesFromOutput(text) {
   // Try code block first
   const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/);
@@ -256,28 +258,107 @@ function extractTextFromStreamJson(rawLines) {
   return resultText || assistantText;
 }
 
+function extractReadVerificationSection(text) {
+  const content = String(text || '').trim();
+  if (!content) return '';
+  const lines = content.split(/\r?\n/);
+  const collected = [];
+  let inJsonBlock = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^```json/i.test(trimmed)) {
+      inJsonBlock = true;
+      break;
+    }
+    if (/^```/.test(trimmed)) continue;
+    if (!trimmed) {
+      if (collected.length > 0) collected.push('');
+      continue;
+    }
+    collected.push(line);
+  }
+  return collected.join('\n').trim();
+}
+
+function isReadVerificationFailed(text) {
+  return /读图验证失败[：:]/.test(String(text || ''));
+}
+
+// step: 'step1' (single design image) or 'step2' (dual image comparison)
+function hasMeaningfulReadVerification(text, step) {
+  const verification = extractReadVerificationSection(text);
+  if (!verification || verification.length < 20) return false;
+  if (step === 'step1') {
+    // step1: single design image — just needs ANY meaningful image content description
+    // Model should describe title/color/module visible in the image
+    const signals = [
+      /[\u4e00-\u9fa5]{2,}/, // at least some Chinese characters (page content)
+    ];
+    // Must have at least 30 chars of real content description
+    return verification.length >= 30 && signals.every(regex => regex.test(verification));
+  }
+  // step2: dual image comparison
+  const signals = [
+    /开发稿|dev/i,
+    /设计稿|design/i,
+    /标题|顶部文字|顶部模块|文字|模块/,
+    /主色|背景色|色调|颜色/,
+  ];
+  return signals.every(regex => regex.test(verification));
+}
+
+function ensureUICheckReadVerificationOrThrow(analysisOutput, step) {
+  if (isReadVerificationFailed(analysisOutput)) {
+    const failReason = analysisOutput.match(/读图验证失败[：:]\s*(.+)/)?.[1] || '未知原因';
+    return { ok: false, reason: failReason, verification: extractReadVerificationSection(analysisOutput) };
+  }
+  if (!hasMeaningfulReadVerification(analysisOutput, step)) {
+    return { ok: false, reason: '模型未返回完整读图验证信息，无法确认图片已被真实读取', verification: extractReadVerificationSection(analysisOutput) };
+  }
+  return { ok: true, reason: '', verification: extractReadVerificationSection(analysisOutput) };
+}
+
 // Parse design spec JSON from step 1 output
 function parseDesignSpecFromOutput(text) {
+  // Helper to clean JSON content that may have unescaped quotes inside string values
+  function sanitizeJson(jsonStr) {
+    // Replace Chinese curly quotes with straight ones
+    return jsonStr
+      .replace(/“/g, '"')
+      .replace(/”/g, '"')
+      .replace(/‘/g, "'")
+      .replace(/’/g, "'");
+  }
+
   const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/);
   if (jsonMatch) {
-    try { return JSON.parse(jsonMatch[1]); } catch {}
+    try { return JSON.parse(sanitizeJson(jsonMatch[1])); } catch {}
+    // Fallback: try to parse despite errors using a lenient approach
+    try {
+      // Fix unescaped double quotes inside string values with a regex
+      const fixed = jsonMatch[1]
+        .replace(/“/g, '')
+        .replace(/”/g, '')
+        .replace(/[\u4e00-\u9fa5][\u201c\u201d]/g, (m) => m[0]);
+      return JSON.parse(fixed);
+    } catch {}
   }
   const arrMatch = text.match(/\[[\s\S]*"name"[\s\S]*\]/);
   if (arrMatch) {
-    try { return JSON.parse(arrMatch[0]); } catch {}
+    try { return JSON.parse(sanitizeJson(arrMatch[0])); } catch {}
   }
   // Fallback: find any JSON-looking array
   const first = text.indexOf('[');
   const last = text.lastIndexOf(']');
   if (first !== -1 && last > first) {
-    try { return JSON.parse(text.slice(first, last + 1)); } catch {}
+    try { return JSON.parse(sanitizeJson(text.slice(first, last + 1))); } catch {}
   }
   return null;
 }
 
 async function createAnalysisImage(srcPath, suffix) {
   if (!srcPath || !fs.existsSync(srcPath)) return srcPath;
-  const outDir = '/tmp/uicheck-analysis';
+  const outDir = UICHECK_ANALYSIS_IMAGES_DIR;
   fs.mkdirSync(outDir, { recursive: true });
   const base = path.basename(srcPath, path.extname(srcPath));
   const targetPath = path.join(outDir, `${base}-${suffix}.png`);
@@ -443,30 +524,30 @@ function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath
 
   return `你是一个资深的设计走查助手，负责对比开发稿截图和设计稿截图的视觉差异。
 
-## ⚠️ 必须先完成读图验证（严格执行）
+## 图片输入（必须按附件读取，不要把路径当普通文本）
+开发稿：
+${toCodeFlickerFileRef(devPath)}
 
-Step 1：读取开发稿截图（代码实现产物）：${toCodeFlickerFileRef(devPath)}
-Step 2：读取设计稿截图（设计目标效果图）：${toCodeFlickerFileRef(designPath)}
+设计稿：
+${toCodeFlickerFileRef(designPath)}
 
-**读不到任何一张真实图就立即停止，输出"读图验证失败：[原因]"，不要继续分析或输出 JSON。**
+## ⚠️ 必须先完成硬读图验证（严格执行）
+- 先分别读取上面的两张图片
+- 如果任意一张图片没有被当成真实视觉输入读取，立即输出“读图验证失败：[原因]”并停止
+- 禁止在读图失败时继续输出问题 JSON、issue table 或任何问题列表
 
-### 读图验证
-**开发稿（代码实现产物）可见内容：**
-- 页面标题文字（精确引用原图中看到的文字）
-- 从上到下可见的主要模块名称和位置
-- 整体色调和布局特征
+### 硬读图验证输出要求
+请先输出“读图验证”小节，并严格包含以下内容：
+1. 开发稿真实可见的页面标题/顶部文字（逐字引用）
+2. 开发稿顶部主色、页面主背景色、顶部第一个模块名称
+3. 设计稿真实可见的页面标题/顶部文字（逐字引用）
+4. 设计稿顶部主色、页面主背景色、顶部第一个模块名称
+5. 回答“开发稿和设计稿是否为两张不同图片：是/否”
+6. 回答“这两张图是否描述同一个页面或同一组模块：是/否 + 理由”
 
-**设计稿（设计目标效果图）可见内容：**
-- 页面标题文字（精确引用原图中看到的文字）
-- 从上到下可见的主要模块名称和位置
-- 整体色调和布局特征
-
-**身份确认：**
-- 开发稿和设计稿是否为两张不同图片？（必须回答"是"才能继续）
-- 两张图描述的是同一个页面/同一组模块吗？（必须回答才能继续）
-
-如果验证失败（两张图内容完全无法对应、或无法确认是两张不同图片），输出：
-"读图验证失败：[原因]"，然后停止，不要输出 JSON。
+如果任意一项无法基于图片直接回答，输出：
+“读图验证失败：[具体原因]”
+然后停止，不要输出 JSON。
 
 ## 图片身份铁则
 - 开发稿截图 = 代码实现产物（路径：${devPath}）
@@ -693,7 +774,7 @@ function attachGeneratedIssueImages(issueData) {
 }
 
 
-// Generate issue table from Claude output (for both single-page step 2 and folder mode)
+// Generate issue table from FlickCLI output (for both single-page step 2 and folder mode)
 async function generateIssueTable(fullOutput, files, typeDir, isFolderMode, res) {
   try {
     const data = parseIssuesFromOutput(fullOutput);
@@ -714,7 +795,7 @@ async function generateIssueTable(fullOutput, files, typeDir, isFolderMode, res)
       for (const issue of items) {
         let devImg = null, designImg = null;
 
-        // New SKILL format: images array of paths (Claude already cropped + boxed)
+        // New SKILL format: images array of paths (Claude (kimi-k2.5) already cropped + boxed)
         if (issue.images && issue.images.length >= 2) {
           devImg = await imageToBase64(issue.images[0]);
           designImg = await imageToBase64(issue.images[1]);
@@ -977,8 +1058,21 @@ function cleanPRDImageText(text) {
 }
 
 // Analyze endpoint (SSE streaming)
+// Allowed vision models for uicheck
+const UICHECK_VISION_MODELS = {
+  'kimi-k2.5': 'kimi-k2.5',
+  'claude': 'claude',       // alias → claude-4.6-sonnet
+  '5': '5',                 // alias → gpt-5.4
+  'gemini': 'gemini'        // alias → gemini-3.1-pro-preview
+};
+const UICHECK_DEFAULT_MODEL = 'kimi-k2.5';
+
 app.get('/api/analyze/:type', async (req, res) => {
   const { type } = req.params;
+  const visionModel = req.query.model && UICHECK_VISION_MODELS[req.query.model]
+    ? req.query.model
+    : UICHECK_DEFAULT_MODEL;
+  console.log('[analyze] type:', type, 'vision model:', visionModel);
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -1108,16 +1202,18 @@ app.get('/api/analyze/:type', async (req, res) => {
     res.write(`data: ${JSON.stringify({ type: 'status', content: '正在分析设计稿结构...' })}\n\n`);
   }
 
-  // colortry uses interactive mode (needs to run bash for color analysis script)
-  // lowfi/builder use interactive mode (need to read skills and generate figma plugin code)
-  // uicheck uses stream-json to prevent process hang / truncated output
+  // uicheck step1 uses flickcli -q mode with vision model (kimi-k2.5) and @absolute-path image
+  const uicheckVisionModel = visionModel;  // from query param
   const isInteractive = type === 'colortry' || type === 'lowfi' || type === 'builder';
   const useStreamJson = type === 'uicheck';
   const outputFormat = useStreamJson ? 'stream-json' : 'text';
-  const claudeArgs = isInteractive
-    ? ['--approval-mode', 'yolo', '--output-format', outputFormat, prompt]
-    : ['-q', '--approval-mode', 'yolo', '--output-format', outputFormat, prompt];
-  const claude = spawn('codeflicker', claudeArgs, {
+  const modelArgs = type === 'uicheck' ? ['--model', uicheckVisionModel] : [];
+  const cliCmd = type === 'uicheck' ? 'flickcli' : 'codeflicker';
+  const cliArgs = isInteractive
+    ? [...modelArgs, '--approval-mode', 'yolo', '--output-format', outputFormat, prompt]
+    : [...modelArgs, '-q', '--approval-mode', 'yolo', '--output-format', outputFormat, prompt];
+  console.log('[uicheck] CLI:', cliCmd, 'args:', JSON.stringify(cliArgs));
+  const flickcli = spawn(cliCmd, cliArgs, {
     cwd: PARENT_DIR,
     env: { ...process.env }
   });
@@ -1129,7 +1225,7 @@ app.get('/api/analyze/:type', async (req, res) => {
   // For uicheck single-page mode, hide step 1 output from frontend
   const uicheckSinglePage = type === 'uicheck';
 
-  claude.stdout.on('data', (chunk) => {
+  flickcli.stdout.on('data', (chunk) => {
     const text = chunk.toString();
     fullRawOutput += text;
     if (!uicheckSinglePage && !useStreamJson) {
@@ -1137,7 +1233,7 @@ app.get('/api/analyze/:type', async (req, res) => {
     }
   });
 
-  claude.stderr.on('data', (chunk) => {
+  flickcli.stderr.on('data', (chunk) => {
     const text = chunk.toString();
     if (!useStreamJson) {
       res.write(`data: ${JSON.stringify({ type: 'stderr', content: text })}\n\n`);
@@ -1145,7 +1241,7 @@ app.get('/api/analyze/:type', async (req, res) => {
     console.log(`[${type} stderr]`, text.slice(0, 200));
   });
 
-  claude.on('close', async (code) => {
+  flickcli.on('close', async (code) => {
     // For stream-json mode, extract the text content
     if (useStreamJson) {
       fullTextOutput = extractTextFromStreamJson(fullRawOutput);
@@ -1153,18 +1249,29 @@ app.get('/api/analyze/:type', async (req, res) => {
       fullTextOutput = fullRawOutput;
     }
     // Debug: save full output
-    fs.writeFileSync('/tmp/claude-uicheck-output.txt', fullTextOutput);
-    fs.writeFileSync('/tmp/claude-uicheck-output-raw.txt', fullRawOutput);
+    fs.writeFileSync('/tmp/flickcli-uicheck-output.txt', fullTextOutput);
+    fs.writeFileSync('/tmp/flickcli-uicheck-output-raw.txt', fullRawOutput);
     console.log('[uicheck] full text output length:', fullTextOutput.length, 'raw length:', fullRawOutput.length);
 
     if (code !== 0) {
       const quotaErr = /quota|authenticate|403|token-plan/i.test(fullTextOutput + fullRawOutput);
       const errMsg = quotaErr
         ? 'CodeFlicker 调用失败：账号额度或鉴权异常（403/token-plan）。请先恢复 CodeFlicker 可用额度后重试。'
-        : `CodeFlicker 调用失败（退出码 ${code}）。请查看服务端日志和 /tmp/claude-uicheck-output.txt。`;
+        : `CodeFlicker 调用失败（退出码 ${code}）。请查看服务端日志和 /tmp/flickcli-uicheck-output.txt。`;
       res.write(`data: ${JSON.stringify({ type: 'error', content: errMsg })}\n\n`);
       res.end();
       return;
+    }
+
+    // For uicheck: detect vision model quota exhaustion or GLM fallback
+    if (type === 'uicheck') {
+      const quotaExhausted = /额度上限|已达到使用额度|fallback to wanqing/i.test(fullRawOutput);
+      if (quotaExhausted) {
+        console.log('[uicheck step1] ERROR: vision model quota exhausted or fell back to GLM (no vision)');
+        res.write(`data: ${JSON.stringify({ type: 'error', content: '视觉模型（claude-sonnet）额度已用完，系统 fallback 到无视觉能力的 GLM 模型，无法读图。请等待额度刷新（约12小时）后重试。' })}\n\n`);
+        res.end();
+        return;
+      }
     }
 
     // For uicheck: fixed single-page main flow
@@ -1175,11 +1282,10 @@ app.get('/api/analyze/:type', async (req, res) => {
       console.log('[uicheck step1] parsed JSON:', JSON.stringify(designSpec, null, 2));
       console.log('[uicheck step1] verification text:', fullTextOutput.slice(0, 500));
 
-      // Check for Step1 verification failure
-      if (fullTextOutput.includes('读图验证失败')) {
-        const failReason = fullTextOutput.match(/读图验证失败[：:]\s*(.+)/)?.[1] || '未知原因';
-        console.log('[uicheck step1] verification failed:', failReason);
-        res.write(`data: ${JSON.stringify({ type: 'error', content: '设计稿读图验证失败：' + failReason + '。请检查上传的设计稿图片是否正确。' })}\n\n`);
+      const step1Verification = ensureUICheckReadVerificationOrThrow(fullTextOutput, 'step1');
+      if (!step1Verification.ok) {
+        console.log('[uicheck step1] verification failed:', step1Verification.reason);
+        res.write(`data: ${JSON.stringify({ type: 'error', content: '设计稿读图验证失败：' + step1Verification.reason + '。请检查上传的设计稿图片是否正确。' })}\n\n`);
         res.end();
         return;
       }
@@ -1208,10 +1314,12 @@ app.get('/api/analyze/:type', async (req, res) => {
         console.log('[uicheck step 2] designFilePath:', designFilePath);
         const step2DevInfo = await logImageInfo('step2-dev-original', devPath);
         const step2DesignInfo = await logImageInfo('step2-design-original', designFilePath);
-        const analysisDevPath = await createAnalysisImage(devPath, 'dev');
-        const analysisDesignPath = await createAnalysisImage(designFilePath, 'design');
-        const step2AnalysisDevInfo = await logImageInfo('step2-dev-analysis', analysisDevPath);
-        const step2AnalysisDesignInfo = await logImageInfo('step2-design-analysis', analysisDesignPath);
+        // Use original uploaded files directly — skip intermediate sharp conversion
+        // (sharp re-encode was causing model to read wrong image content)
+        const analysisDevPath = devPath;
+        const analysisDesignPath = designFilePath;
+        const step2AnalysisDevInfo = step2DevInfo;
+        const step2AnalysisDesignInfo = step2DesignInfo;
         const step2AnalysisPrompt = buildUICheckStep2AnalysisPrompt(designSpec, analysisDevPath, analysisDesignPath, bgContent);
         const step2PromptPath = writeUICheckPromptDebugFile('step2-analysis', step2AnalysisPrompt);
         const step2References = [SKILL_MD_PATH, ...loadSkillContext('analysis').map(f => f.path)].filter(fp => fs.existsSync(fp));
@@ -1223,6 +1331,10 @@ app.get('/api/analyze/:type', async (req, res) => {
           referenceFiles: step2References
         });
         console.log('[uicheck step2] final prompt:\n' + step2AnalysisPrompt);
+        console.log('[uicheck step2] prompt image refs:', JSON.stringify([
+          toCodeFlickerFileRef(analysisDevPath),
+          toCodeFlickerFileRef(analysisDesignPath)
+        ]));
         await appendUICheckRuntimeDebug({
           phase: 'step2-before-model',
           flow,
@@ -1251,11 +1363,14 @@ app.get('/api/analyze/:type', async (req, res) => {
         });
 
         // Phase A: issue detection only (stream-json for raw debug + final text extraction)
-        const claude2 = spawn('codeflicker', [
+        const step2Args = [
+          '--model', visionModel,
           '-q', '--approval-mode', 'yolo',
           '--output-format', 'stream-json',
           step2AnalysisPrompt
-        ], {
+        ];
+        console.log('[uicheck step2] flickcli args:', JSON.stringify(step2Args));
+        const flickcli2 = spawn('flickcli', step2Args, {
           cwd: PARENT_DIR,
           env: { ...process.env }
         });
@@ -1265,8 +1380,8 @@ app.get('/api/analyze/:type', async (req, res) => {
         const step2AnalysisTimer = setTimeout(() => {
           step2AnalysisTimedOut = true;
           console.log('[uicheck step2 analysis] timeout - killing process');
-          claude2.kill('SIGTERM');
-          setTimeout(() => { try { claude2.kill('SIGKILL'); } catch {} }, 3000);
+          flickcli2.kill('SIGTERM');
+          setTimeout(() => { try { flickcli2.kill('SIGKILL'); } catch {} }, 3000);
         }, STEP2_ANALYSIS_TIMEOUT_MS);
 
         let step2StartTime = Date.now();
@@ -1276,14 +1391,14 @@ app.get('/api/analyze/:type', async (req, res) => {
         }, 15000);
 
         let step2RawLines = '';
-        claude2.stdout.on('data', (chunk) => {
+        flickcli2.stdout.on('data', (chunk) => {
           step2RawLines += chunk.toString();
         });
-        claude2.stderr.on('data', (chunk) => {
+        flickcli2.stderr.on('data', (chunk) => {
           console.log('[uicheck step2 analysis stderr]', chunk.toString().slice(0, 200));
         });
 
-        claude2.on('close', async (code2) => {
+        flickcli2.on('close', async (code2) => {
           clearTimeout(step2AnalysisTimer);
           const rawOutput = step2RawLines;
           const analysisOutput = extractTextFromStreamJson(step2RawLines).trim();
@@ -1309,15 +1424,32 @@ app.get('/api/analyze/:type', async (req, res) => {
             return;
           }
 
+          // Detect vision model quota exhaustion for step2
+          const step2QuotaExhausted = /额度上限|已达到使用额度|fallback to wanqing/i.test(rawOutput);
+          if (step2QuotaExhausted) {
+            clearInterval(heartbeat);
+            console.log('[uicheck step2] ERROR: vision model quota exhausted');
+            res.write(`data: ${JSON.stringify({ type: 'error', content: '对比阶段视觉模型额度已用完，无法读图。请等待额度刷新（约12小时）后重试。' })}\n\n`);
+            res.end();
+            return;
+          }
+
           const issueData = parseIssuesFromOutput(analysisOutput);
           console.log('[uicheck step2] parsed JSON:', JSON.stringify(issueData, null, 2));
 
-          // Check for verification failure in model output
-          if (analysisOutput.includes('读图验证失败')) {
+          const verificationGate = ensureUICheckReadVerificationOrThrow(analysisOutput, 'step2');
+          if (!verificationGate.ok) {
             clearInterval(heartbeat);
-            const failReason = analysisOutput.match(/读图验证失败[：:]\s*(.+)/)?.[1] || '未知原因';
-            console.log('[uicheck step2] verification failed:', failReason);
-            res.write(`data: ${JSON.stringify({ type: 'error', content: '读图验证失败：' + failReason + '。请检查上传的开发截图和设计稿是否正确。' })}\n\n`);
+            console.log('[uicheck step2] verification failed:', verificationGate.reason);
+            await appendUICheckRuntimeDebug({
+              phase: 'step2-verification-failed',
+              flow,
+              verification: verificationGate.verification,
+              reason: verificationGate.reason,
+              rawOutput,
+              analysisOutput
+            });
+            res.write(`data: ${JSON.stringify({ type: 'error', content: '读图验证失败：' + verificationGate.reason + '。请检查上传的开发截图和设计稿是否正确。' })}\n\n`);
             res.end();
             return;
           }
@@ -1355,7 +1487,7 @@ app.get('/api/analyze/:type', async (req, res) => {
           res.write(`data: ${JSON.stringify({ type: 'done', code: 0 })}\n\n`);
           res.end();
         });
-        claude2.on('error', (err) => {
+        flickcli2.on('error', (err) => {
           clearTimeout(step2AnalysisTimer);
           clearInterval(heartbeat);
           res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`);
@@ -1365,7 +1497,7 @@ app.get('/api/analyze/:type', async (req, res) => {
       }
 
       console.log('[uicheck step 2] missing dev file or empty design spec');
-      res.write(`data: ${JSON.stringify({ type: 'error', content: '设计稿结构解析失败，请检查设计稿是否可读，或查看 /tmp/claude-uicheck-output.txt 排查 Claude 输出。' })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'error', content: '设计稿结构解析失败，请检查设计稿是否可读，或查看 /tmp/flickcli-uicheck-output.txt 排查 FlickCLI 输出。' })}\n\n`);
       res.end();
       return;
     }
@@ -1387,7 +1519,7 @@ app.get('/api/analyze/:type', async (req, res) => {
     res.end();
   });
 
-  claude.on('error', (err) => {
+  flickcli.on('error', (err) => {
     res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`);
     res.end();
   });
@@ -1431,7 +1563,7 @@ function buildPRDPrompt(files, type) {
 
   return `你是一名资深 UX 设计评审助手。请按以下步骤执行：
 
-Step 1：使用 Read 工具读取 .claude/skills/prdcheck/SKILL.md，了解评审规则。
+Step 1：使用 Read 工具读取 .codeflicker/skills/prdcheck/SKILL.md，了解评审规则。
 Step 2：使用 Read 工具逐一读取 designer-platform/inputs/${type}/ 目录下的文本文件：${txtFiles.join(', ') || '无'}
 ${imgStep}Step 4：按照 SKILL.md 中的规则进行分析。
 
@@ -1557,46 +1689,36 @@ function buildUICheckPrompt(files, type, uicheckContext = null) {
   }
 
   // Single page mode — Step 1: analyze design ONLY, output module spec
-  const designPathFromContext = uicheckContext?.designPath || '';
   const designFile = files.find(f => /design_mockup/i.test(f)) || files.find(f => /^design[_-]/i.test(f)) || files.find(f => isUICheckImageFile(f));
-  const designPath = path.resolve(designPathFromContext || (designFile ? path.join(typeDir, designFile) : ''));
+  const designAbsPath = path.resolve(path.join(typeDir, designFile));
 
-  const skillMarkdown = loadUICheckSkillMarkdown();
   const bgContent = txtFiles.length > 0
     ? readTextFileIfExists(path.resolve(path.join(typeDir, txtFiles[0]))).trim().slice(0, 2000)
     : '';
 
-  let prompt = `你是一名资深 UI 设计师。你的任务是分析一张**设计稿**图片，从上到下列出页面模块。
+  let prompt = `你是一名资深 UI 设计师。分析下面这张**设计稿**图片，从上到下列出页面模块。
 
-## ⚠️ 必须先完成读图验证
+## 设计稿图片
 
-请按以下步骤严格执行：
+@${designAbsPath}
 
-Step 1：读取设计稿图片：${toCodeFlickerFileRef(designPath)}
-Step 2：读图后，先输出一段**读图验证文字**，格式如下：
-- 图片中可见的标题文字（精确引用）
-- 图片中可见的主要模块名称和位置（从上到下）
-- 图片整体色调和布局特征
+## 读图验证（必须先执行）
 
-**读不到真实设计稿图片就立即停止，输出"读图验证失败"，不要继续输出 JSON。**
+先输出“读图验证”段落，严格包含：
+1. 图片中真实可见的标题/页面名称（逐字引用）
+2. 图片顶部主色、主背景色
+3. 从上到下第一个主要模块名称
 
-Step 3：确认验证文字与图片内容吻合后，再输出模块清单 JSON。
+如果无法看到图片内容，输出“读图验证失败：[reason]” 并停止。
 
-## 禁止事项
-- 禁止在没有读到图片的情况下直接输出 JSON
-- 禁止凭想象编造模块名称和内容
-- 禁止参考任何示例或历史上下文来猜测图片内容
-- 只输出你从图片中实际看到的内容
-
-## uicheck_pro SKILL.md（已内嵌，无需额外读取）
-${skillMarkdown || 'SKILL.md 未读取到，请仅按当前截图可见内容输出。'}
-
+禁止凭想象编造内容，只输出图片中实际可见的。
+JSON 字段值中禁止出现中文引号（""），只用英文双引号，如需引用含引号的文字用单引号替代。
 `;
   if (bgContent) {
-    prompt += `## 背景信息\n${bgContent}\n\n`;
+    prompt += `\n## 背景信息\n${bgContent}\n`;
   }
-  prompt += `## 输出格式\n`;
-  prompt += `先输出读图验证文字，然后输出 JSON 数组（不要任何其他文字）：\n`;
+  prompt += `\n## 输出格式\n`;
+  prompt += `先输出读图验证，然后输出 JSON 数组：\n`;
   prompt += `\`\`\`json\n`;
   prompt += `[\n`;
   prompt += `  {"order": 1, "name": "模块名称", "content": "模块内容概述", "visual": "视觉特征概述"},\n`;
@@ -1613,7 +1735,7 @@ function buildUsertestPrompt(files, type) {
   const typeDir = getInputsDir(type);
   const imageRefs = toCodeFlickerImageRefs(typeDir, imgFiles);
   let msg = `你是一名资深移动端UI/UX可用性评测专家，具备用户行为心理分析能力。请按以下步骤执行：\n\n`;
-  msg += `Step 1：使用 Read 工具读取 .claude/skills/usertest/SKILL.md，了解评测规则。\n`;
+  msg += `Step 1：使用 Read 工具读取 .codeflicker/skills/usertest/SKILL.md，了解评测规则。\n`;
   msg += `Step 2：使用 Read 工具读取以下文件：\n`;
   if (txtFiles.length > 0) msg += `  - 用户画像文件：designer-platform/inputs/${type}/${txtFiles[0]}\n`;
   if (imageRefs.length > 0) {
@@ -1651,7 +1773,7 @@ function buildEdgecasePrompt(files, type) {
   const typeDir = getInputsDir(type);
   const imageRefs = toCodeFlickerImageRefs(typeDir, imgFiles);
   let msg = `你是轻量化UX原型隐患分析师。请按以下步骤执行：\n\n`;
-  msg += `Step 1：使用 Read 工具读取 .claude/skills/edgecase/SKILL.md，了解分析规则。\n`;
+  msg += `Step 1：使用 Read 工具读取 .codeflicker/skills/edgecase/SKILL.md，了解分析规则。\n`;
   msg += `Step 2：使用 Read 工具读取以下文件：\n`;
   if (txtFiles.length > 0) msg += `  - 用户画像文件：designer-platform/inputs/${type}/${txtFiles[0]}\n`;
   if (imageRefs.length > 0) {
@@ -1686,7 +1808,7 @@ function buildEdgecasePrompt(files, type) {
 function buildColortryPrompt(files, type) {
   const imgFiles = files.filter(f => /\.(png|jpg|jpeg|gif|webp|svg|bmp)$/i.test(f));
   let msg = `你是资深 UI 色彩系统设计师兼前端开发专家。请按以下步骤执行：\n\n`;
-  msg += `Step 1：使用 Read 工具读取 .claude/skills/colortry/SKILL.md，了解配色规则。\n`;
+  msg += `Step 1：使用 Read 工具读取 .codeflicker/skills/colortry/SKILL.md，了解配色规则。\n`;
   msg += `Step 2：运行颜色分析脚本提取主色调。\n`;
   msg += `  在终端执行：node designer-platform/color-analyze.js designer-platform/inputs/${type}/${imgFiles[0]}\n`;
   msg += `  该脚本会输出精确的 JSON 颜色数据（包含 themeHue、isDark、bg、card、primary 等所有色值）。\n`;
@@ -1725,7 +1847,7 @@ function buildColortryPrompt(files, type) {
 
 function buildLowfiPrompt(files, type) {
   let msg = `你是资深中文UX交互设计师，同时是 Figma 插件开发工程师。请按以下步骤执行：\n\n`;
-  msg += `Step 1：使用 Read 工具读取 .claude/skills/lowfi/SKILL.md，了解完整规则和规范。\n`;
+  msg += `Step 1：使用 Read 工具读取 .codeflicker/skills/lowfi/SKILL.md，了解完整规则和规范。\n`;
   msg += `Step 2：读取以下需求内容，理解业务目标、用户场景和核心流程。\n`;
 
   const typeDir = getInputsDir(type);
@@ -1772,7 +1894,7 @@ function buildLowfiPrompt(files, type) {
 
 function buildBuilderPrompt(files, type) {
   let msg = `你是资深 B端 UI 设计师，同时是 Figma 插件开发工程师。请按以下步骤执行：\n\n`;
-  msg += `Step 1：使用 Read 工具读取 .claude/skills/builder/SKILL.md，了解完整规则和组件规范。\n`;
+  msg += `Step 1：使用 Read 工具读取 .codeflicker/skills/builder/SKILL.md，了解完整规则和组件规范。\n`;
   msg += `Step 2：读取以下需求内容，理解业务目标和页面结构。\n`;
 
   const typeDir = getInputsDir(type);
@@ -1812,7 +1934,7 @@ function buildBuilderPrompt(files, type) {
   return msg;
 }
 
-// Debug endpoint - 直接查看 Claude 是否被调用
+// Debug endpoint - 直接查看 FlickCLI 是否被调用
 app.get('/api/figma-check-debug', async (req, res) => {
   const typeDir = getInputsDir('figma');
   const files = fs.readdirSync(typeDir);
@@ -1852,7 +1974,7 @@ app.get('/api/figma-check-debug', async (req, res) => {
 
 现在请开始走查。`;
 
-  const claude = spawn('codeflicker', [
+  const flickcli = spawn('flickcli', [
     '-q', '--approval-mode', 'yolo', '--output-format', 'text', fullPrompt
   ], {
     cwd: PARENT_DIR,
@@ -1860,12 +1982,12 @@ app.get('/api/figma-check-debug', async (req, res) => {
   });
 
   let fullOutput = '';
-  claude.stdout.on('data', (chunk) => { fullOutput += chunk.toString(); });
-  claude.stderr.on('data', (chunk) => { console.log('[figma-debug stderr]:', chunk.toString().substring(0, 500)); });
+  flickcli.stdout.on('data', (chunk) => { fullOutput += chunk.toString(); });
+  flickcli.stderr.on('data', (chunk) => { console.log('[figma-debug stderr]:', chunk.toString().substring(0, 500)); });
 
-  claude.on('close', (code) => {
-    console.log('[figma-check-debug] Claude output length:', fullOutput.length);
-    console.log('[figma-check-debug] Claude output preview:', fullOutput.substring(0, 500));
+  flickcli.on('close', (code) => {
+    console.log('[figma-check-debug] FlickCLI output length:', fullOutput.length);
+    console.log('[figma-check-debug] FlickCLI output preview:', fullOutput.substring(0, 500));
 
     let issues = [];
     try {
@@ -1887,7 +2009,7 @@ app.get('/api/figma-check-debug', async (req, res) => {
     fs.writeFileSync('/tmp/figma-check-debug-output.txt', fullOutput, 'utf-8');
 
     res.json({
-      claudeCode: code,
+      flickcliExitCode: code,
       outputLength: fullOutput.length,
       outputPreview: fullOutput.substring(0, 1000),
       issuesCount: issues.length,
@@ -1898,7 +2020,7 @@ app.get('/api/figma-check-debug', async (req, res) => {
     });
   });
 
-  claude.on('error', (err) => {
+  flickcli.on('error', (err) => {
     res.json({ error: err.message, files: files });
   });
 });
@@ -1937,7 +2059,7 @@ app.post('/api/figma/design', uploadFigma.array('files', 1), async (req, res) =>
 
 只需输出 JSON 数组，不要其他文字。`;
 
-  const claude = spawn('codeflicker', [
+  const flickcli = spawn('flickcli', [
     '-q', '--approval-mode', 'yolo', '--output-format', 'text', prompt
   ], {
     cwd: PARENT_DIR,
@@ -1945,11 +2067,11 @@ app.post('/api/figma/design', uploadFigma.array('files', 1), async (req, res) =>
   });
 
   let fullOutput = '';
-  claude.stdout.on('data', (chunk) => { fullOutput += chunk.toString(); });
+  flickcli.stdout.on('data', (chunk) => { fullOutput += chunk.toString(); });
 
-  const timeout = setTimeout(() => { claude.kill(); }, 3 * 60 * 1000);
+  const timeout = setTimeout(() => { flickcli.kill(); }, 3 * 60 * 1000);
 
-  claude.on('close', () => {
+  flickcli.on('close', () => {
     clearTimeout(timeout);
     console.log('[figma-design] output length:', fullOutput.length);
 
@@ -1968,7 +2090,7 @@ app.post('/api/figma/design', uploadFigma.array('files', 1), async (req, res) =>
     res.json({ modules, designPath, fullOutput: fullOutput.substring(0, 500) });
   });
 
-  claude.on('error', (err) => {
+  flickcli.on('error', (err) => {
     clearTimeout(timeout);
     res.status(500).json({ error: err.message });
   });
@@ -2039,7 +2161,7 @@ ${bgText ? '## 背景信息\n' + bgText + '\n' : ''}
 
 现在请输出 JSON 数组：`;
 
-  const claude = spawn('codeflicker', [
+  const flickcli = spawn('flickcli', [
     '-q', '--approval-mode', 'yolo', '--output-format', 'text', prompt
   ], {
     cwd: PARENT_DIR,
@@ -2047,17 +2169,17 @@ ${bgText ? '## 背景信息\n' + bgText + '\n' : ''}
   });
 
   let fullOutput = '';
-  claude.stdout.on('data', (chunk) => { fullOutput += chunk.toString(); });
-  claude.stderr.on('data', (chunk) => { console.log('[figma-dev stderr]:', chunk.toString().substring(0, 200)); });
+  flickcli.stdout.on('data', (chunk) => { fullOutput += chunk.toString(); });
+  flickcli.stderr.on('data', (chunk) => { console.log('[figma-dev stderr]:', chunk.toString().substring(0, 200)); });
 
   const timeout = setTimeout(() => {
-    claude.kill();
+    flickcli.kill();
     if (!res.headersSent) {
       res.status(504).json({ error: '走查超时' });
     }
   }, 5 * 60 * 1000);
 
-  claude.on('close', () => {
+  flickcli.on('close', () => {
     clearTimeout(timeout);
     console.log('[figma-dev] output length:', fullOutput.length);
     console.log('[figma-dev] preview:', fullOutput.substring(0, 300));
@@ -2094,7 +2216,7 @@ ${bgText ? '## 背景信息\n' + bgText + '\n' : ''}
     res.json({ issues, fullOutput, reportPath });
   });
 
-  claude.on('error', (err) => {
+  flickcli.on('error', (err) => {
     clearTimeout(timeout);
     console.log('[figma-dev] spawn error:', err.message);
     if (res.headersSent) return;

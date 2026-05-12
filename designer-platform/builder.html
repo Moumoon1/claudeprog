@@ -54,7 +54,7 @@
         </div>
         <div class="loading-step" id="stepAnalyze">
           <span class="step-indicator"></span>
-          <span>Claude Code 分析并绘制中</span>
+          <span>FlickCLI 分析并绘制中</span>
         </div>
         <div class="loading-step" id="stepDone">
           <span class="step-indicator"></span>
@@ -211,7 +211,7 @@
         if (!uploadRes.ok) throw new Error('上传失败');
 
         setLoading(true, 'stepAnalyze');
-        setLoadingText('Claude Code 启动中...');
+        setLoadingText('FlickCLI 启动中...');
         resultArea.classList.add('visible');
         const eventSource = new EventSource('/api/analyze/builder');
         let accumulated = '';
