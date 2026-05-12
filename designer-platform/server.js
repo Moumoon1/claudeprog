@@ -1140,6 +1140,19 @@ app.get('/api/analyze/:type', async (req, res) => {
     return res.end();
   }
 
+  // Clean all non-current-type input dirs and uicheck outputs on every analyze run
+  for (const subDir of fs.readdirSync(INPUTS_DIR)) {
+    const subPath = path.join(INPUTS_DIR, subDir);
+    if (subDir !== type && fs.statSync(subPath).isDirectory()) {
+      for (const f of fs.readdirSync(subPath)) fs.unlinkSync(path.join(subPath, f));
+      console.log(`[analyze] cleaned old files from inputs/${subDir}`);
+    }
+  }
+  if (type === 'uicheck' && fs.existsSync(OUTPUTS_DIR)) {
+    for (const f of fs.readdirSync(OUTPUTS_DIR)) fs.unlinkSync(path.join(OUTPUTS_DIR, f));
+    console.log(`[analyze] cleaned old files from outputs/`);
+  }
+
   // Validate content length - only for PRD type to prevent analyzing empty/fetch-failed content
   if (type === 'prd') {
     const mainFile = files.find(f => /prd\.txt$/i.test(f)) || files[0];

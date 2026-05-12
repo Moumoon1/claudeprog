@@ -1,0 +1,15 @@
+node_modules/
+inputs/
+outputs/
+runtime_images/
+.tmp_uicheck_verify/
+.DS_Store
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.docx
+!designer-platform/assets/**/*
+!.claude/skills/uicheck_pro/assets/**/*
