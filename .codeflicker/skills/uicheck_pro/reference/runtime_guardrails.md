@@ -48,6 +48,29 @@
 - 结论只能来自当次截图中可见证据；截图里看不到的模块名、业务名、文案，不得凭 reference 补写
 - 若某条结论的关键词只出现在 reference、不出现在截图证据中，必须删除或改写为基于截图可见事实的描述
 
+## Python 截图脚本 UTF-8 编码（v12 已修复）
+- `generateScreenshotScript()` 生成的 Python 脚本内嵌中文 JSON 数据（问题描述），脚本开头必须声明 `# -*- coding: utf-8 -*-`
+- 没有编码声明时，Python 3.9 解析器遇到中文 UTF-8 字节会抛 `SyntaxError: Non-UTF-8 code starting with '\xe5'`，导致 Phase B 截图静默失败
+- **教训**：任何动态生成 Python 脚本并内嵌中文/非 ASCII 数据的场景，必须在脚本开头声明编码
+
+## 疑似问题检出率（v12 优化）
+- 数量上限从 8 改为 15（confirmed + suspected 合计）
+- specText（设计稿模块清单）不再截断 name/content/visual，模型能看到完整描述和视觉特征
+- false_positives.md 中"极弱的视觉感觉型判断"不再默认排除，改为建议纳入疑似问题
+- prompt 明确鼓励疑似问题多报："宁可多报也不要漏报"
+
 ## assets/examples 默认不进入 analysis
 - assets 和 examples 默认不进入 analysis 阶段 prompt，只在调试截图规则或误判案例时按需使用
 - 截图规范示例（assets/screenshots/）只在调试截图框选规则时按需加载，analysis 阶段不强制读取
+
+## devCropRegion / designCropRegion 必须相同（v13 新增）
+- **问题**：模型为 dev 和 design 输出了不同的 CropRegion，导致两张截图的视窗范围错位，用户无法左右对比
+- **规则**：`devCropRegion` 和 `designCropRegion` 必须完全相同（top/bottom/left/right 四值一致）；`devBox` 和 `designBox` 可以不同，但必须框选同一视觉元素
+- **写入位置**：`server.js buildUICheckStep2AnalysisPrompt()` 的"截图坐标强制规则"段；`output_schema.md` 坐标规则段
+- **验证方法**：检查 outputs/ 目录下同一 issue 的 dev/design 截图，确认两张图的高度相近（视窗一致）
+
+## 前端 zoomImages 数组覆盖 bug（v13 已修复）
+- **现象**：点击 confirmed 表格截图缩略图，放大图却显示 suspected 的截图（对不上）
+- **根因**：每次 `renderTable()` 都用局部 `zoomImages` 覆盖 `window._zoomImages`；suspected 表格渲染后，confirmed 的所有 idx 全部错位
+- **修复**：改为累积追加（`if (!window._zoomImages) window._zoomImages = []`，直接引用全局数组而非覆盖）；每次新走查开始时重置 `window._zoomImages = []`
+- **位置**：`designer-platform/uicheck.html` 第 827 行及走查开始的 reset 处

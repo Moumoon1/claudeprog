@@ -1291,14 +1291,14 @@ textarea::placeholder {
 .issue-table tbody tr:hover { background: #fafafa; }
 
 /* Column widths (proportional to docx cm widths: 1.0, 6.8, 1.8, 7.8, 1.8, 1.4, 2.1, 2.1) */
-.issue-table .col-seq       { width: 3%;  text-align: center; font-weight: 600; color: #71717a; }
-.issue-table .col-desc       { width: 25%; }
+.issue-table .col-seq       { width: 2%;  text-align: center; font-weight: 600; color: #71717a; }
+.issue-table .col-desc       { width: 33%; }
 .issue-table .col-status     { width: 6%;  text-align: center; }
 .issue-table .col-screenshot { width: 30%; }
 .issue-table .col-date       { width: 6%;  text-align: center; }
 .issue-table .col-priority   { width: 5%;  text-align: center; }
-.issue-table .col-reviewer   { width: 10%; text-align: center; }
-.issue-table .col-owner      { width: 10%; text-align: center; }
+.issue-table .col-reviewer   { width: 9%; text-align: center; }
+.issue-table .col-owner      { width: 9%; text-align: center; }
 
 /* Description cell */
 .desc-text {

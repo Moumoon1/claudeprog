@@ -20,6 +20,7 @@ const SERVER_VERSION = '2026.05.10-v1';
 const SKILL_DIR = path.join(PARENT_DIR, '.codeflicker/skills/uicheck_pro');
 const SKILL_MD_PATH = path.join(SKILL_DIR, 'SKILL.md');
 const REF_DIR = path.join(SKILL_DIR, 'reference');
+const REF_DIR_B = path.join(SKILL_DIR, 'reference-b');
 const OUTPUTS_DIR = path.join(SKILL_DIR, 'outputs');
 
 function readTextFileIfExists(filePath) {
@@ -31,7 +32,11 @@ function readTextFileIfExists(filePath) {
   }
 }
 
-function loadUICheckSkillMarkdown() {
+function loadUICheckSkillMarkdown(pageType = 'c') {
+  if (pageType === 'b') {
+    const bPath = path.join(REF_DIR_B, 'SKILL.md');
+    if (fs.existsSync(bPath)) return readTextFileIfExists(bPath);
+  }
   return readTextFileIfExists(SKILL_MD_PATH);
 }
 
@@ -46,24 +51,35 @@ function toCodeFlickerImageRefs(typeDir, files = []) {
     .filter(Boolean);
 }
 
-function loadSkillContext(stage) {
+function loadSkillContext(stage, pageType = 'c') {
   // stage: 'analysis' → issue_rules + false_positives + output_schema + runtime_guardrails
   // stage: 'screenshot' → screenshot_rules
   // stage: 'doc' → doc_rules
+  // pageType: 'b' uses reference-b/ for issue_rules + false_positives; others fall back to reference/
+  const baseDir = REF_DIR;
+  const bDir = REF_DIR_B;
   const files = [];
   try {
     if (stage === 'analysis') {
-      for (const name of ['issue_rules.md', 'false_positives.md', 'output_schema.md', 'runtime_guardrails.md']) {
-        const fp = path.join(REF_DIR, name);
+      // issue_rules and false_positives: use B-specific if pageType='b' and file exists
+      for (const name of ['issue_rules.md', 'false_positives.md']) {
+        const bPath = path.join(bDir, name);
+        const fp = (pageType === 'b' && fs.existsSync(bPath)) ? bPath : path.join(baseDir, name);
+        const content = readTextFileIfExists(fp);
+        if (content) files.push({ name, path: fp, content });
+      }
+      // output_schema and runtime_guardrails: always use base reference/
+      for (const name of ['output_schema.md', 'runtime_guardrails.md']) {
+        const fp = path.join(baseDir, name);
         const content = readTextFileIfExists(fp);
         if (content) files.push({ name, path: fp, content });
       }
     } else if (stage === 'screenshot') {
-      const fp = path.join(REF_DIR, 'screenshot_rules.md');
+      const fp = path.join(baseDir, 'screenshot_rules.md');
       const content = readTextFileIfExists(fp);
       if (content) files.push({ name: 'screenshot_rules.md', path: fp, content });
     } else if (stage === 'doc') {
-      const fp = path.join(REF_DIR, 'doc_rules.md');
+      const fp = path.join(baseDir, 'doc_rules.md');
       const content = readTextFileIfExists(fp);
       if (content) files.push({ name: 'doc_rules.md', path: fp, content });
     }
@@ -356,23 +372,30 @@ function parseDesignSpecFromOutput(text) {
   return null;
 }
 
+// Compress image by file size (not pixel dimensions) to prevent model read failure.
+// Only reduces JPEG quality if file exceeds size threshold — pixel dimensions are preserved,
+// so 1-2px level details remain visible to the model.
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB threshold — images under this rarely trigger model read failures
+
 async function createAnalysisImage(srcPath, suffix) {
   if (!srcPath || !fs.existsSync(srcPath)) return srcPath;
   const outDir = UICHECK_ANALYSIS_IMAGES_DIR;
   fs.mkdirSync(outDir, { recursive: true });
   const base = path.basename(srcPath, path.extname(srcPath));
-  const targetPath = path.join(outDir, `${base}-${suffix}.png`);
+  const targetPath = path.join(outDir, `${base}-${suffix}.jpg`);
   try {
-    const meta = await sharp(srcPath).metadata();
-    const needResize = (meta.width || 0) > 1400 || (meta.height || 0) > 2200;
-    if (!needResize) {
-      await sharp(srcPath).png().toFile(targetPath);
-      return targetPath;
+    const stat = fs.statSync(srcPath);
+    if (stat.size <= MAX_IMAGE_BYTES) {
+      // File is small enough — use original, no compression needed
+      return srcPath;
     }
+    // File too large: compress to JPEG at quality 85, keep original pixel dimensions
+    console.log(`[uicheck analysis image] compressing ${Math.round(stat.size / 1024)}KB → jpeg q80 at original size`);
     await sharp(srcPath)
-      .resize({ width: 1400, height: 2200, fit: 'inside', withoutEnlargement: true })
-      .png()
+      .jpeg({ quality: 80, mozjpeg: false })
       .toFile(targetPath);
+    const newStat = fs.statSync(targetPath);
+    console.log(`[uicheck analysis image] compressed to ${Math.round(newStat.size / 1024)}KB`);
     return targetPath;
   } catch (err) {
     console.log('[uicheck analysis image] fallback to original:', err.message);
@@ -511,11 +534,11 @@ async function logImageInfo(label, imgPath) {
 // Backend reads skill reference files and injects into prompt — model does NOT need to Read skill files
 function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath) {
   const specText = designSpec.map(m =>
-    (m.order || '') + '. ' + String(m.name || '').slice(0, 40) + '：' + String(m.content || '').slice(0, 120) + '，视觉特征：' + String(m.visual || '').slice(0, 80)
+    (m.order || '') + '. ' + String(m.name || '') + '：' + String(m.content || '') + '，视觉特征：' + String(m.visual || '')
   ).join('\n');
 
-  const skillMarkdown = loadUICheckSkillMarkdown();
-  const skillCtx = loadSkillContext('analysis');
+  const skillMarkdown = loadUICheckSkillMarkdown(pageType);
+  const skillCtx = loadSkillContext('analysis', pageType);
   const inlineSkill = skillMarkdown ? `\n## uicheck_pro SKILL.md（已内嵌，无需额外读取）\n${skillMarkdown}\n` : '';
   let inlineRules = '';
   for (const f of skillCtx) {
@@ -563,11 +586,27 @@ ${inlineSkill}
 ${inlineRules}
 
 ### 输出限制
-- 最多输出 8 条问题（confirmed + suspected 合计）
+- 最多输出 15 条问题（confirmed + suspected 合计）
+- 疑似问题不要过于保守——只要两图间有任何可见的视觉差异迹象，且不是明确的动态数据差异，都应该纳入 suspected，宁可多报也不要漏报
 - 坐标使用 0.0-1.0 比例
 - 先识别同一个对象，再分别给 dev/design 坐标，禁止位置投影
 - 不得框整图、不得框错对象、不得把 design 的位置投影到 dev
 - 每条问题的 problem 必须描述你在两张图中分别看到的具体差异，不允许模糊描述
+
+### 截图坐标强制规则（必须遵守）
+- **devCropRegion 和 designCropRegion 必须完全相同**：两张截图的上下文视窗必须对齐，用户才能左右对比，不同的 CropRegion 会导致截图范围错位，无法对比。
+- **devBox 和 designBox 坐标必须不同（除非两图该元素位置完全一致）**：你必须分别在 dev 图和 design 图中独立定位问题元素的精确位置，而不是复制同一个坐标。同一个元素在两张图里的实际位置往往有偏差，框的坐标应该反映各自图片中的真实位置。
+- 合格示例：标题"创作任务"在 dev 图中偏右（devBox.left=0.35），在 design 图中居中（designBox.left=0.28），两个 Box 坐标不同是正确的。
+- 不合格示例：devBox 和 designBox 完全一样——说明你没有独立定位，而是复制了坐标，这会导致一边框准另一边框歪。
+- 不合格示例：dev CropRegion = {top:0.47, bottom:0.73}，design CropRegion = {top:0.43, bottom:0.51}，两个截图窗口完全不同——禁止这样输出。
+
+### 动态数据禁止上报（强制）
+以下差异**绝对不允许出现在输出 JSON 中**（confirmed 和 suspected 都不行）：
+- 用户昵称不同、用户头像不同
+- 金额/数值/时间/日期不同
+- 任务进度数字不同（如 0/1）
+- 运营配置文案不同
+只有当**结构本身**发生了变化（有 vs 无某个元素）时才可以报，但不能描述动态内容的具体差异。
 
 ## 设计稿的页面结构清单（设计目标）
 ${specText}
@@ -607,7 +646,8 @@ function generateScreenshotScript(issueData, devPath, designPath) {
     rulesComment += `# --- ${f.name} ---\n# ${f.content.replace(/\n/g, '\n# ')}\n`;
   }
 
-  const script = `import os, json
+  const script = `# -*- coding: utf-8 -*-
+import os, json
 from PIL import Image, ImageDraw
 
 os.makedirs("${outputDir}", exist_ok=True)
@@ -1072,7 +1112,8 @@ app.get('/api/analyze/:type', async (req, res) => {
   const visionModel = req.query.model && UICHECK_VISION_MODELS[req.query.model]
     ? req.query.model
     : UICHECK_DEFAULT_MODEL;
-  console.log('[analyze] type:', type, 'vision model:', visionModel);
+  const pageType = req.query.pageType === 'b' ? 'b' : 'c';
+  console.log('[analyze] type:', type, 'vision model:', visionModel, 'pageType:', pageType);
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -1134,6 +1175,10 @@ app.get('/api/analyze/:type', async (req, res) => {
     const devInfo = await logImageInfo('step1-dev-selected', devPath);
     const designInfo = await logImageInfo('step1-design-selected', designPath);
 
+    // Compress large images (by file size) before passing to step1 model
+    const step1DesignPath = await createAnalysisImage(designPath, 'step1-design');
+    console.log(`[uicheck step1] design path for model: ${step1DesignPath}`);
+
     console.log('[uicheck step1] files:', files);
     console.log('[uicheck step1] devFiles:', uicheckFlow.devFiles);
     console.log('[uicheck step1] designFiles:', uicheckFlow.designFiles);
@@ -1152,6 +1197,8 @@ app.get('/api/analyze/:type', async (req, res) => {
       designFile,
       devPath,
       designPath,
+      step1DesignPath,
+      pageType,
       devInfo,
       designInfo
     };
@@ -1312,17 +1359,16 @@ app.get('/api/analyze/:type', async (req, res) => {
         console.log('[uicheck step 2] designFile:', designFile);
         console.log('[uicheck step 2] devPath:', devPath);
         console.log('[uicheck step 2] designFilePath:', designFilePath);
+        // Compress large images (by file size) before passing to step2 model
         const step2DevInfo = await logImageInfo('step2-dev-original', devPath);
         const step2DesignInfo = await logImageInfo('step2-design-original', designFilePath);
-        // Use original uploaded files directly — skip intermediate sharp conversion
-        // (sharp re-encode was causing model to read wrong image content)
-        const analysisDevPath = devPath;
-        const analysisDesignPath = designFilePath;
-        const step2AnalysisDevInfo = step2DevInfo;
-        const step2AnalysisDesignInfo = step2DesignInfo;
-        const step2AnalysisPrompt = buildUICheckStep2AnalysisPrompt(designSpec, analysisDevPath, analysisDesignPath, bgContent);
+        const analysisDevPath = await createAnalysisImage(devPath, 'step2-dev');
+        const analysisDesignPath = await createAnalysisImage(designFilePath, 'step2-design');
+        const step2AnalysisDevInfo = await logImageInfo('step2-dev-for-model', analysisDevPath);
+        const step2AnalysisDesignInfo = await logImageInfo('step2-design-for-model', analysisDesignPath);
+        const step2AnalysisPrompt = buildUICheckStep2AnalysisPrompt(designSpec, analysisDevPath, analysisDesignPath, bgContent, pageType);
         const step2PromptPath = writeUICheckPromptDebugFile('step2-analysis', step2AnalysisPrompt);
-        const step2References = [SKILL_MD_PATH, ...loadSkillContext('analysis').map(f => f.path)].filter(fp => fs.existsSync(fp));
+        const step2References = [SKILL_MD_PATH, ...loadSkillContext('analysis', pageType).map(f => f.path)].filter(fp => fs.existsSync(fp));
         logUICheckRunMeta('step2', {
           flowName: flow.flowName,
           flowFunction: flow.flowFunction,
@@ -1683,6 +1729,7 @@ function buildUICheckPrompt(files, type, uicheckContext = null) {
   const txtFiles = files.filter(f => /background\.txt$/i.test(f));
   const typeDir = getInputsDir(type);
   const flow = uicheckContext?.flow || resolveUICheckFlow(files, uicheckContext?.latestUploadState || null);
+  const pageType = uicheckContext?.pageType || 'c';
 
   if (flow.mode === 'folder') {
     throw new Error('uicheck folder-mode is disabled for current requests');
@@ -1690,14 +1737,18 @@ function buildUICheckPrompt(files, type, uicheckContext = null) {
 
   // Single page mode — Step 1: analyze design ONLY, output module spec
   const designFile = files.find(f => /design_mockup/i.test(f)) || files.find(f => /^design[_-]/i.test(f)) || files.find(f => isUICheckImageFile(f));
-  const designAbsPath = path.resolve(path.join(typeDir, designFile));
+  const designRawPath = path.resolve(path.join(typeDir, designFile));
+  // Use pre-compressed path from context if available, otherwise use raw path
+  const designAbsPath = uicheckContext?.step1DesignPath || designRawPath;
 
   const bgContent = txtFiles.length > 0
     ? readTextFileIfExists(path.resolve(path.join(typeDir, txtFiles[0]))).trim().slice(0, 2000)
     : '';
 
-  let prompt = `你是一名资深 UI 设计师。分析下面这张**设计稿**图片，从上到下列出页面模块。
+  const bHint = pageType === 'b' ? readTextFileIfExists(path.join(REF_DIR_B, 'step1_hint.md')) : '';
 
+  let prompt = `你是一名资深 UI 设计师。分析下面这张**设计稿**图片，从上到下列出页面模块。
+${bHint ? `\n${bHint}\n` : ''}
 ## 设计稿图片
 
 @${designAbsPath}

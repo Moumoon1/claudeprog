@@ -134,6 +134,17 @@
       <p class="model-note">选择用于读图的视觉模型。不同模型额度独立，如遇额度上限会自动提示。</p>
     </div>
 
+    <!-- 页面类型选择 -->
+    <div class="section">
+      <h3>&#128196; 页面类型</h3>
+      <div class="page-type-toggle">
+        <button class="page-type-btn active" id="btnC" onclick="selectPageType('c')">C端页面</button>
+        <button class="page-type-btn" id="btnB" onclick="selectPageType('b')">B端页面</button>
+        <input type="hidden" id="pageType" value="c">
+      </div>
+      <p class="model-note" id="pageTypeNote">C端：移动端活动页、功能页，关注视觉还原和结构一致性。</p>
+    </div>
+
     <button class="submit-btn" id="submitBtn" onclick="startReview()">
       <span class="spinner"></span>
       <span class="btn-text">开始走查</span>
@@ -267,6 +278,31 @@
       color: #94a3b8;
       margin-top: 8px;
       line-height: 1.5;
+    }
+    .page-type-toggle {
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .page-type-btn {
+      padding: 6px 18px;
+      border-radius: 8px;
+      border: 1.5px solid #e5e7eb;
+      background: #fff;
+      font-size: 14px;
+      color: #6b7280;
+      cursor: pointer;
+      transition: all 0.15s;
+      font-weight: 500;
+    }
+    .page-type-btn:hover {
+      border-color: #a5b4fc;
+      color: #4f46e5;
+    }
+    .page-type-btn.active {
+      border-color: #6366f1;
+      background: #eef2ff;
+      color: #4f46e5;
     }
     .copy-btn {
       padding: 6px 14px;
@@ -495,6 +531,17 @@
     let currentTab = 'single';
     const folderFiles = { dev: [], design: [] };
 
+    // Page type toggle (B/C end)
+    function selectPageType(type) {
+      document.getElementById('pageType').value = type;
+      document.getElementById('btnC').classList.toggle('active', type === 'c');
+      document.getElementById('btnB').classList.toggle('active', type === 'b');
+      const note = document.getElementById('pageTypeNote');
+      note.textContent = type === 'b'
+        ? 'B端：管理后台、数据看板、运营工具，关注表格、筛选、操作区的结构还原。'
+        : 'C端：移动端活动页、功能页，关注视觉还原和结构一致性。';
+    }
+
     // Custom model dropdown
     function toggleModelDropdown() {
       const trigger = document.getElementById('modelTrigger');
@@ -718,6 +765,7 @@
       resultArea.classList.remove('visible');
       resultContent.innerHTML = '';
       resultMarkdown = '';
+      window._zoomImages = [];
 
       document.querySelectorAll('.loading-step').forEach(s => {
         s.classList.remove('active', 'done');
@@ -756,7 +804,8 @@
         setLoadingText('CodeFlicker 启动中...');
         resultArea.classList.add('visible');
         const visionModel = document.getElementById('visionModel').value;
-        const eventSource = new EventSource('/api/analyze/uicheck?model=' + encodeURIComponent(visionModel));
+        const pageType = document.getElementById('pageType').value;
+        const eventSource = new EventSource('/api/analyze/uicheck?model=' + encodeURIComponent(visionModel) + '&pageType=' + encodeURIComponent(pageType));
 
         eventSource.onmessage = (e) => {
           const msg = JSON.parse(e.data);
@@ -824,7 +873,8 @@
           html += '<th>跟进人</th>';
           html += '</tr></thead><tbody>';
 
-          const zoomImages = [];
+          if (!window._zoomImages) window._zoomImages = [];
+          const zoomImages = window._zoomImages;
           rows.forEach((row, i) => {
             // Support both old (severity) and new (priority) format
             const priority = row.priority || (row.severity === 'high' ? 'P0' : row.severity === 'low' ? 'P2' : 'P1');
@@ -833,17 +883,10 @@
               : (suspectLevelColors[row.suspectLevel] || suspectLevelColors['中疑似']);
             const status = row.status || (isConfirmed ? '待修改' : '待确认');
 
-            // Description: supports both old (description) and new (problem) format
+            // Description: only show problem text
             let desc = '';
             const problemText = row.problem || row.description || '';
             if (problemText) desc += `<div class="desc-text">${problemText}</div>`;
-            if (row.suggestion) desc += `<div class="desc-text"><strong>建议：</strong>${row.suggestion}</div>`;
-            if (!isConfirmed) {
-              if (row.reason) desc += `<div class="desc-text suspect"><strong>怀疑点：</strong>${row.reason}</div>`;
-              if (row.basis) desc += `<div class="desc-text suspect"><strong>观察依据：</strong>${row.basis}</div>`;
-              if (row.whyNotConfirmed) desc += `<div class="desc-text suspect"><strong>暂不确认原因：</strong>${row.whyNotConfirmed}</div>`;
-              if (row.verifySuggestion) desc += `<div class="desc-text suspect"><strong>确认建议：</strong>${row.verifySuggestion}</div>`;
-            }
 
             let screenshotHtml = '';
             if (row.devImg || row.designImg) {
@@ -875,7 +918,6 @@
             html += '</tr>';
           });
 
-          window._zoomImages = zoomImages;
           html += '</tbody></table></div>';
           resultContent.innerHTML += html;
         }
