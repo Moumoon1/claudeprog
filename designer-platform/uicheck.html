@@ -108,28 +108,27 @@
       <h3>&#129302; 视觉模型</h3>
       <div class="model-dropdown" id="modelDropdown">
         <div class="model-dropdown-trigger" id="modelTrigger" onclick="toggleModelDropdown()">
-          <span class="model-dropdown-label" id="modelLabel">Kimi K2.5（推荐）</span>
+          <span class="model-dropdown-label" id="modelLabel">GPT 5.4（推荐）</span>
           <svg class="model-dropdown-arrow" id="modelArrow" viewBox="0 0 12 12" width="14" height="14"><path d="M3 4.5L6 7.5L9 4.5" stroke="#6366f1" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </div>
         <div class="model-dropdown-menu" id="modelMenu">
-          <div class="model-dropdown-item selected" data-value="kimi-k2.5" onclick="selectModel('kimi-k2.5', 'Kimi K2.5（推荐）')">
+          <div class="model-dropdown-item" data-value="kimi-k2.5" onclick="selectModel('kimi-k2.5', 'Kimi K2.5')">
             <span class="model-item-name">Kimi K2.5</span>
-            <span class="model-item-tag recommended">推荐</span>
           </div>
           <div class="model-dropdown-item" data-value="claude" onclick="selectModel('claude', 'Claude Sonnet 4.6')">
             <span class="model-item-name">Claude Sonnet 4.6</span>
             <span class="model-item-tag limited">额度受限</span>
           </div>
-          <div class="model-dropdown-item" data-value="5" onclick="selectModel('5', 'GPT 5.4')">
+          <div class="model-dropdown-item selected" data-value="5" onclick="selectModel('5', 'GPT 5.4（推荐）')">
             <span class="model-item-name">GPT 5.4</span>
-            <span class="model-item-tag limited">额度受限</span>
+            <span class="model-item-tag recommended">推荐</span>
           </div>
           <div class="model-dropdown-item" data-value="gemini" onclick="selectModel('gemini', 'Gemini 3.1 Pro')">
             <span class="model-item-name">Gemini 3.1 Pro</span>
             <span class="model-item-tag limited">额度受限</span>
           </div>
         </div>
-        <input type="hidden" id="visionModel" value="kimi-k2.5">
+        <input type="hidden" id="visionModel" value="5">
       </div>
       <p class="model-note">选择用于读图的视觉模型。不同模型额度独立，如遇额度上限会自动提示。</p>
     </div>

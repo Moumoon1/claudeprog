@@ -74,6 +74,12 @@ function loadSkillContext(stage, pageType = 'c') {
         const content = readTextFileIfExists(fp);
         if (content) files.push({ name, path: fp, content });
       }
+      // B端专属截图规范：b_screenshot_guide.md 内嵌到 analysis prompt
+      if (pageType === 'b') {
+        const bScreenshotGuide = path.join(bDir, 'b_screenshot_guide.md');
+        const content = readTextFileIfExists(bScreenshotGuide);
+        if (content) files.push({ name: 'b_screenshot_guide.md', path: bScreenshotGuide, content });
+      }
     } else if (stage === 'screenshot') {
       const fp = path.join(baseDir, 'screenshot_rules.md');
       const content = readTextFileIfExists(fp);
@@ -403,6 +409,38 @@ async function createAnalysisImage(srcPath, suffix) {
   }
 }
 
+// Resize dev image to match design image width (B端专用：消除宽度差异，减少比例感知误差)
+// 等比缩放开发稿到设计稿宽度，只影响传给模型和截图脚本的分析图，不修改原始上传文件
+async function resizeDevToMatchDesign(devPath, designPath, suffix) {
+  if (!devPath || !designPath || !fs.existsSync(devPath) || !fs.existsSync(designPath)) return devPath;
+  try {
+    const designMeta = await sharp(designPath).metadata();
+    const devMeta = await sharp(devPath).metadata();
+    const targetWidth = designMeta.width;
+    if (!targetWidth || devMeta.width === targetWidth) {
+      console.log(`[uicheck resize] dev width already matches design (${devMeta.width}px), skipping`);
+      return devPath;
+    }
+    const outDir = UICHECK_ANALYSIS_IMAGES_DIR;
+    fs.mkdirSync(outDir, { recursive: true });
+    const base = path.basename(devPath, path.extname(devPath));
+    const targetPath = path.join(outDir, `${base}-${suffix}-resized.jpg`);
+    if (devMeta.width > targetWidth * 2) {
+      console.warn(`[uicheck resize] WARNING: design width (${targetWidth}px) is much smaller than dev (${devMeta.width}px), downscaling`);
+    }
+    await sharp(devPath)
+      .resize({ width: targetWidth, withoutEnlargement: false })
+      .jpeg({ quality: 85 })
+      .toFile(targetPath);
+    const newMeta = await sharp(targetPath).metadata();
+    console.log(`[uicheck resize] dev ${devMeta.width}x${devMeta.height} → ${newMeta.width}x${newMeta.height} (matched design width ${targetWidth}px)`);
+    return targetPath;
+  } catch (err) {
+    console.log('[uicheck resize] fallback to original dev:', err.message);
+    return devPath;
+  }
+}
+
 function isUICheckImageFile(file) {
   return /\.(png|jpg|jpeg|webp|bmp|gif)$/i.test(file || '');
 }
@@ -532,7 +570,7 @@ async function logImageInfo(label, imgPath) {
 
 // Build step 2 analysis prompt for single-page uicheck (issue detection only)
 // Backend reads skill reference files and injects into prompt — model does NOT need to Read skill files
-function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath) {
+function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath, pageType = 'c') {
   const specText = designSpec.map(m =>
     (m.order || '') + '. ' + String(m.name || '') + '：' + String(m.content || '') + '，视觉特征：' + String(m.visual || '')
   ).join('\n');
@@ -1105,7 +1143,7 @@ const UICHECK_VISION_MODELS = {
   '5': '5',                 // alias → gpt-5.4
   'gemini': 'gemini'        // alias → gemini-3.1-pro-preview
 };
-const UICHECK_DEFAULT_MODEL = 'kimi-k2.5';
+const UICHECK_DEFAULT_MODEL = '5';
 
 app.get('/api/analyze/:type', async (req, res) => {
   const { type } = req.params;
@@ -1375,8 +1413,12 @@ app.get('/api/analyze/:type', async (req, res) => {
         // Compress large images (by file size) before passing to step2 model
         const step2DevInfo = await logImageInfo('step2-dev-original', devPath);
         const step2DesignInfo = await logImageInfo('step2-design-original', designFilePath);
-        const analysisDevPath = await createAnalysisImage(devPath, 'step2-dev');
+        let analysisDevPath = await createAnalysisImage(devPath, 'step2-dev');
         const analysisDesignPath = await createAnalysisImage(designFilePath, 'step2-design');
+        // B端专用：将开发稿宽度对齐设计稿，减少比例差异导致的坐标估算偏差
+        if (pageType === 'b') {
+          analysisDevPath = await resizeDevToMatchDesign(analysisDevPath, analysisDesignPath, 'step2');
+        }
         const step2AnalysisDevInfo = await logImageInfo('step2-dev-for-model', analysisDevPath);
         const step2AnalysisDesignInfo = await logImageInfo('step2-design-for-model', analysisDesignPath);
         const step2AnalysisPrompt = buildUICheckStep2AnalysisPrompt(designSpec, analysisDevPath, analysisDesignPath, bgContent, pageType);
