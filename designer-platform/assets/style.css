@@ -9,6 +9,7 @@ body {
   background: #fafafa;
   color: #111;
   min-height: 100vh;
+  overflow-y: scroll;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -152,6 +153,13 @@ body {
   padding: 40px 32px 60px;
 }
 
+.page-logo {
+  width: 25%;
+  height: auto;
+  display: block;
+  margin-bottom: 20px;
+}
+
 .page-desc {
   background: rgba(56, 189, 248, 0.04);
   border: 1px solid rgba(56, 189, 248, 0.1);
@@ -213,7 +221,8 @@ textarea::placeholder {
   gap: 12px;
 }
 
-.upload-box {
+.upload-box,
+.folder-upload-box {
   border: 1px dashed #d4d4d4;
   border-radius: 10px;
   padding: 24px 16px;
@@ -229,7 +238,8 @@ textarea::placeholder {
   background: #fafafa;
 }
 
-.upload-box:hover {
+.upload-box:hover,
+.folder-upload-box:hover {
   border-color: #111;
   background: #f5f5f5;
 }
@@ -241,16 +251,19 @@ textarea::placeholder {
   background: #fff;
 }
 
-.upload-box input[type="file"] {
+.upload-box input[type="file"],
+.folder-upload-box input[type="file"] {
   display: none;
 }
 
-.upload-box .upload-label {
+.upload-box .upload-label,
+.folder-upload-box .upload-label {
   color: #999;
   font-size: 13px;
 }
 
-.upload-box .upload-label span {
+.upload-box .upload-label span,
+.folder-upload-box .upload-label span {
   display: block;
   font-size: 28px;
   margin-bottom: 8px;
@@ -635,6 +648,7 @@ textarea::placeholder {
 }
 .tab-content { display: none; }
 .tab-content.active { display: block; }
+.tabs-container { position: relative; }
 
 /* URL Input */
 .prd-input-section .url-input-wrapper {

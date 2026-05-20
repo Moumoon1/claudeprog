@@ -1,4 +1,6 @@
 node_modules/
+!designer-platform/node_modules/
+.claude/node_modules/
 inputs/
 outputs/
 runtime_images/

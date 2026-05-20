@@ -12,23 +12,37 @@
 </head>
 <body>
   <div class="header">
-    <a href="index.html" class="back-btn">&#8592; 返回首页</a>
     <h1>走查</h1>
   </div>
 
   <div class="page">
+    <img src="UI.png" class="page-logo" alt="UI">
     <div class="page-desc">上传开发页面截图和设计稿长图，AI 自动对比两者差异，生成带截图标注的走查报告，帮助快速发现样式偏差和模块缺失。</div>
 
-    <!-- Tab 切换 -->
+    <!-- 页面类型选择 -->
+    <div class="section">
+      <h3>&#128196; 页面类型</h3>
+      <div class="page-type-toggle">
+        <button class="page-type-btn active" id="btnC" onclick="selectPageType('c')">C端页面</button>
+        <button class="page-type-btn" id="btnB" onclick="selectPageType('b')">B端页面</button>
+        <input type="hidden" id="pageType" value="c">
+      </div>
+      <p class="model-note" id="pageTypeNote">C端：移动端活动页、功能页，关注视觉还原和结构一致性。</p>
+    </div>
+
+    <!-- 上传模块（标题固定，tab 切换内容） -->
+    <div class="section">
+      <h3>&#128187; 页面上传</h3>
     <div class="upload-tabs">
       <div class="upload-tab active" data-tab="single" onclick="switchTab('single')">&#128247; 单页面上传</div>
       <div class="upload-tab" data-tab="folder" onclick="switchTab('folder')">&#128194; 文件夹上传</div>
     </div>
 
+    <!-- Tab 内容容器 -->
+    <div class="tabs-container">
     <!-- 单页面上传 -->
     <div class="tab-content active" id="singleTab">
-      <div class="section">
-        <h3>&#128187; 开发截图 &nbsp;&#127912; 设计稿</h3>
+      <div>
         <div class="upload-grid">
           <div class="upload-box" id="devBox" onclick="document.getElementById('devFile').click()">
             <input type="file" id="devFile" accept="image/*" onchange="handleImage(this, 'devBox', 'dev')">
@@ -50,51 +64,48 @@
 
     <!-- 文件夹上传 -->
     <div class="tab-content" id="folderTab">
-      <div class="naming-tip">
-        <strong>&#9888;&#65039; 命名规则提醒</strong>
-        <p>开发截图和设计稿必须使用<strong>相同的文件名</strong>才能自动配对对比。例如：</p>
-        <div class="naming-example">
-          <div class="naming-side">
-            <div class="naming-side-title">&#128187; 开发截图文件夹</div>
-            <div class="naming-file">首页.png</div>
-            <div class="naming-file">列表页.png</div>
-            <div class="naming-file">详情页.png</div>
+      <div>
+        <div class="upload-grid">
+          <div class="folder-upload-box" id="devFolderBox" onclick="document.getElementById('devFolder').click()">
+            <input type="file" id="devFolder" webkitdirectory directory multiple onchange="handleFolder(this, 'dev')">
+            <div class="upload-label" id="devFolderLabel">
+              <span>&#128187;</span>
+              开发截图文件夹
+            </div>
           </div>
-          <div class="naming-arrow">→ 自动配对 →</div>
-          <div class="naming-side">
-            <div class="naming-side-title">&#127912; 设计稿文件夹</div>
-            <div class="naming-file">首页.png</div>
-            <div class="naming-file">列表页.png</div>
-            <div class="naming-file">详情页.png</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="section">
-        <h3>&#128187; 开发截图文件夹</h3>
-        <div class="folder-upload-box" id="devFolderBox" onclick="document.getElementById('devFolder').click()">
-          <input type="file" id="devFolder" webkitdirectory directory multiple onchange="handleFolder(this, 'dev')">
-          <div class="folder-label" id="devFolderLabel">
-            <span>&#128194;</span>
-            选择开发截图文件夹
+          <div class="folder-upload-box" id="designFolderBox" onclick="document.getElementById('designFolder').click()">
+            <input type="file" id="designFolder" webkitdirectory directory multiple onchange="handleFolder(this, 'design')">
+            <div class="upload-label" id="designFolderLabel">
+              <span>&#127912;</span>
+              设计稿文件夹
+            </div>
           </div>
         </div>
         <div class="file-list" id="devFileList"></div>
-      </div>
-
-      <div class="section">
-        <h3>&#127912; 设计稿文件夹</h3>
-        <div class="folder-upload-box" id="designFolderBox" onclick="document.getElementById('designFolder').click()">
-          <input type="file" id="designFolder" webkitdirectory directory multiple onchange="handleFolder(this, 'design')">
-          <div class="folder-label" id="designFolderLabel">
-            <span>&#128194;</span>
-            选择设计稿文件夹
+        <div class="file-list" id="designFileList"></div>
+        <div class="pair-status" id="pairStatus"></div>
+        <div class="naming-tip">
+          <strong>&#9888;&#65039; 命名规则提醒</strong>
+          <p>开发截图和设计稿必须使用<strong>相同的文件名</strong>才能自动配对对比。例如：</p>
+          <div class="naming-example">
+            <div class="naming-side">
+              <div class="naming-side-title">&#128187; 开发截图文件夹</div>
+              <div class="naming-file">首页.png</div>
+              <div class="naming-file">列表页.png</div>
+              <div class="naming-file">详情页.png</div>
+            </div>
+            <div class="naming-arrow">→ 自动配对 →</div>
+            <div class="naming-side">
+              <div class="naming-side-title">&#127912; 设计稿文件夹</div>
+              <div class="naming-file">首页.png</div>
+              <div class="naming-file">列表页.png</div>
+              <div class="naming-file">详情页.png</div>
+            </div>
           </div>
         </div>
-        <div class="file-list" id="designFileList"></div>
       </div>
-
-      <div class="pair-status" id="pairStatus"></div>
+    </div>
+    </div>
     </div>
 
     <!-- 背景信息 -->
@@ -131,17 +142,6 @@
         <input type="hidden" id="visionModel" value="5">
       </div>
       <p class="model-note">选择用于读图的视觉模型。不同模型额度独立，如遇额度上限会自动提示。</p>
-    </div>
-
-    <!-- 页面类型选择 -->
-    <div class="section">
-      <h3>&#128196; 页面类型</h3>
-      <div class="page-type-toggle">
-        <button class="page-type-btn active" id="btnC" onclick="selectPageType('c')">C端页面</button>
-        <button class="page-type-btn" id="btnB" onclick="selectPageType('b')">B端页面</button>
-        <input type="hidden" id="pageType" value="c">
-      </div>
-      <p class="model-note" id="pageTypeNote">C端：移动端活动页、功能页，关注视觉还原和结构一致性。</p>
     </div>
 
     <button class="submit-btn" id="submitBtn" onclick="startReview()">
@@ -567,8 +567,10 @@
 
     function switchTab(tab) {
       currentTab = tab;
+      const y = window.scrollY;
       document.querySelectorAll('.upload-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
       document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === tab + 'Tab'));
+      window.scrollTo(0, y);
     }
 
     // Single page upload
