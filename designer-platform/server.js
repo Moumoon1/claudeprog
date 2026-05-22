@@ -10,14 +10,14 @@ const PORT = 3000;
 const PROJECT_DIR = path.resolve(__dirname);
 const INPUTS_DIR = path.join(PROJECT_DIR, 'inputs');
 const PARENT_DIR = path.resolve(PROJECT_DIR, '..');
-const UICHECK_RUNTIME_DEBUG_PATH = '/tmp/uicheck-runtime-debug.json';
-const UICHECK_UPLOAD_STATE_PATH = '/tmp/uicheck-latest-upload.json';
-const UICHECK_PROMPT_DEBUG_DIR = '/tmp/uicheck-prompts';
+const UICHECK_RUNTIME_DEBUG_PATH = path.join(PARENT_DIR, '.claude', 'uicheck-runtime-debug.json');
+const UICHECK_UPLOAD_STATE_PATH = path.join(PARENT_DIR, '.claude', 'uicheck-latest-upload.json');
+const UICHECK_PROMPT_DEBUG_DIR = path.join(PARENT_DIR, '.claude', 'uicheck-prompts');
 const UICHECK_ANALYSIS_IMAGES_DIR = path.join(PROJECT_DIR, 'runtime_images');
 
 // ── uicheck skill directory (唯一运行时目录，无 fallback) ──
-const SERVER_VERSION = '2026.05.10-v1';
-const SKILL_DIR = path.join(PARENT_DIR, '.codeflicker/skills/uicheck_pro');
+const SERVER_VERSION = '2026.05.21-v1';
+const SKILL_DIR = path.join(PARENT_DIR, '.claude', 'skills', 'uicheck_pro');
 const SKILL_MD_PATH = path.join(SKILL_DIR, 'SKILL.md');
 const REF_DIR = path.join(SKILL_DIR, 'reference');
 const REF_DIR_B = path.join(SKILL_DIR, 'reference-b');
@@ -40,7 +40,7 @@ function loadUICheckSkillMarkdown(pageType = 'c') {
   return readTextFileIfExists(SKILL_MD_PATH);
 }
 
-function tomfcliFileRef(filePath) {
+function toClaudeFileRef(filePath) {
   if (!filePath) return '';
   return `@${path.resolve(filePath)}`;
 }
@@ -94,11 +94,11 @@ function loadSkillContext(stage, pageType = 'c') {
 function checkPrerequisites() {
   const missing = [];
 
-  // 检查 mfcli
+  // 检查 claude
   try {
-    require('child_process').execSync('which mfcli', { stdio: 'pipe' });
+    require('child_process').execSync('which claude', { stdio: 'pipe' });
   } catch {
-    missing.push('mfcli（安装: curl -fsSL https://myflicker.corp.kuaishou.com/install-mf.sh | bash）');
+    missing.push('claude CLI（安装: npm install -g @anthropic-ai/claude-cli）');
   }
 
   // 检查 python3 + Pillow
@@ -113,9 +113,9 @@ function checkPrerequisites() {
     }
   }
 
-  // 检查 SKILL.md
+  // 检查 claude skill
   if (!fs.existsSync(SKILL_MD_PATH)) {
-    missing.push('SKILL.md（运行: bash install.sh 部署 skills 文件）');
+    missing.push('uicheck_pro SKILL.md（检查 .claude/skills/uicheck_pro/ 目录）');
   }
 
   if (missing.length > 0) {
@@ -133,7 +133,7 @@ checkPrerequisites();
 // ── 启动时打印关键路径和加载信息 ──
 const loadedRefs = loadSkillContext('analysis');
 console.log(`[uicheck] server version: ${SERVER_VERSION}`);
-console.log(`[uicheck] SKILL_DIR = .codeflicker/skills/uicheck_pro (${SKILL_DIR})`);
+console.log(`[uicheck] SKILL_DIR = .claude/skills/uicheck_pro (${SKILL_DIR})`);
 console.log(`[uicheck] SKILL_MD_PATH = ${SKILL_MD_PATH} (exists: ${fs.existsSync(SKILL_MD_PATH)})`);
 console.log(`[uicheck] REF_DIR = ${REF_DIR}`);
 console.log(`[uicheck] analysis reference files loaded: ${loadedRefs.map(f => f.name).join(', ')}`);
@@ -195,7 +195,7 @@ function getInputsDir(type) {
   return dir;
 }
 
-// Parse JSON from FlickCLI's text output
+// Parse JSON from Claude API's text output
 function parseIssuesFromOutput(text) {
   // Try code block first
   const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/);
@@ -290,7 +290,7 @@ async function cropByDevY(imgPath, devY, box) {
     .catch(() => null);
 }
 
-// Extract final assistant text from mfcli stream-json NDJSON output
+// Extract final assistant text from claude stream-json NDJSON output
 function extractTextFromStreamJson(rawLines) {
   let resultText = '';
   let assistantText = '';
@@ -622,10 +622,10 @@ function buildUICheckStep2AnalysisPrompt(designSpec, devPath, designPath, bgPath
 
 ## 图片输入（必须按附件读取，不要把路径当普通文本）
 开发稿：
-${tomfcliFileRef(devPath)}
+${toClaudeFileRef(devPath)}
 
 设计稿：
-${tomfcliFileRef(designPath)}
+${toClaudeFileRef(designPath)}
 
 ## ⚠️ 必须先完成硬读图验证（严格执行）
 - 先分别读取上面的两张图片
@@ -956,7 +956,7 @@ async function generateIssueScreenshotsWithSharp(issueData, devPath, designPath)
   console.log('[screenshot-sharp] DONE - all issue screenshots generated');
 }
 
-// Execute Python screenshot script directly (fallback if mfcli fails)
+// Execute Python screenshot script directly (fallback if sharp fails)
 async function executeScreenshotScript(scriptContent) {
   const scriptPath = '/tmp/uicheck-screenshot-script.py';
   fs.writeFileSync(scriptPath, scriptContent);
@@ -995,7 +995,7 @@ async function executeScreenshotScript(scriptContent) {
 
 
 // [REMOVED] buildUICheckStep2ScreenshotPrompt — Phase B now uses local Python directly
-// No longer spawn mfcli for screenshots; Node generates Python script and runs it
+// Screenshots are generated locally using Node.js sharp, no external tool needed
 
 
 function attachGeneratedIssueImages(issueData) {
@@ -1018,7 +1018,7 @@ function attachGeneratedIssueImages(issueData) {
 }
 
 
-// Generate issue table from FlickCLI output (for both single-page step 2 and folder mode)
+// Generate issue table from Claude API output (for both single-page step 2 and folder mode)
 async function generateIssueTable(fullOutput, files, typeDir, isFolderMode, res) {
   try {
     const data = parseIssuesFromOutput(fullOutput);
@@ -1358,7 +1358,7 @@ app.get('/api/analyze/:type', async (req, res) => {
       flowName: uicheckStep1Context?.flow?.flowName,
       flowFunction: uicheckStep1Context?.flow?.flowFunction,
       promptFilePath: step1PromptPath,
-      imageRefs: [uicheckStep1Context?.designPath].filter(Boolean).map(p => tomfcliFileRef(p)),
+      imageRefs: [uicheckStep1Context?.designPath].filter(Boolean).map(p => toClaudeFileRef(p)),
       referenceFiles: step1ReferenceFiles
     });
     console.log('[uicheck step1] final prompt:\n' + prompt);
@@ -1380,12 +1380,12 @@ app.get('/api/analyze/:type', async (req, res) => {
         design: uicheckStep1Context?.designInfo || null
       },
       referenceFiles: step1ReferenceFiles,
-      imageRefs: [uicheckStep1Context?.designPath].filter(Boolean).map(p => tomfcliFileRef(p)),
+      imageRefs: [uicheckStep1Context?.designPath].filter(Boolean).map(p => toClaudeFileRef(p)),
       prompt
     });
   }
 
-  res.write(`data: ${JSON.stringify({ type: 'status', content: 'mfcli 启动中...' })}\n\n`);
+  res.write(`data: ${JSON.stringify({ type: 'status', content: 'Claude API 调用中...' })}\n\n`);
 
   // uicheck only keeps the single-page uicheck_pro main flow
   let finalPrompt = prompt;
@@ -1393,15 +1393,15 @@ app.get('/api/analyze/:type', async (req, res) => {
     res.write(`data: ${JSON.stringify({ type: 'status', content: '正在分析设计稿结构...' })}\n\n`);
   }
 
-  // uicheck step1 uses mfcli -q mode with vision model (kimi-k2.5) and @absolute-path image
+  // uicheck step1 uses Claude API with vision model (sonnet-4.6) and @absolute-path image
   const uicheckVisionModel = visionModel;  // from query param
   const useStreamJson = type === 'uicheck';
   const outputFormat = useStreamJson ? 'stream-json' : 'text';
   const modelArgs = type === 'uicheck' ? ['--model', uicheckVisionModel] : [];
-  const cliCmd = 'mfcli';
+  const cliCmd = 'claude';
   const cliArgs = [...modelArgs, '-q', '--approval-mode', 'yolo', '--output-format', outputFormat, prompt];
   console.log('[uicheck] CLI:', cliCmd, 'args:', JSON.stringify(cliArgs));
-  const mfcli = spawn(cliCmd, cliArgs, {
+  const claude = spawn(cliCmd, cliArgs, {
     cwd: PARENT_DIR,
     env: { ...process.env }
   });
@@ -1413,7 +1413,7 @@ app.get('/api/analyze/:type', async (req, res) => {
   // For uicheck single-page mode, hide step 1 output from frontend
   const uicheckSinglePage = type === 'uicheck';
 
-  mfcli.stdout.on('data', (chunk) => {
+  claude.stdout.on('data', (chunk) => {
     const text = chunk.toString();
     fullRawOutput += text;
     if (!uicheckSinglePage && !useStreamJson) {
@@ -1421,7 +1421,7 @@ app.get('/api/analyze/:type', async (req, res) => {
     }
   });
 
-  mfcli.stderr.on('data', (chunk) => {
+  claude.stderr.on('data', (chunk) => {
     const text = chunk.toString();
     if (!useStreamJson) {
       res.write(`data: ${JSON.stringify({ type: 'stderr', content: text })}\n\n`);
@@ -1429,7 +1429,7 @@ app.get('/api/analyze/:type', async (req, res) => {
     console.log(`[${type} stderr]`, text.slice(0, 200));
   });
 
-  mfcli.on('close', async (code) => {
+  claude.on('close', async (code) => {
     // For stream-json mode, extract the text content
     if (useStreamJson) {
       fullTextOutput = extractTextFromStreamJson(fullRawOutput);
@@ -1437,15 +1437,15 @@ app.get('/api/analyze/:type', async (req, res) => {
       fullTextOutput = fullRawOutput;
     }
     // Debug: save full output
-    fs.writeFileSync('/tmp/mfcli-uicheck-output.txt', fullTextOutput);
-    fs.writeFileSync('/tmp/mfcli-uicheck-output-raw.txt', fullRawOutput);
+    fs.writeFileSync(UICHECK_RUNTIME_DEBUG_PATH.replace('.json', '-output.txt'), fullTextOutput);
+    fs.writeFileSync(UICHECK_RUNTIME_DEBUG_PATH.replace('.json', '-output-raw.txt'), fullRawOutput);
     console.log('[uicheck] full text output length:', fullTextOutput.length, 'raw length:', fullRawOutput.length);
 
     if (code !== 0) {
       const quotaErr = /quota|authenticate|403|token-plan/i.test(fullTextOutput + fullRawOutput);
       const errMsg = quotaErr
-        ? 'mfcli 调用失败：账号额度或鉴权异常（403/token-plan）。请先恢复 mfcli 可用额度后重试。'
-        : `mfcli 调用失败（退出码 ${code}）。请查看服务端日志和 /tmp/mfcli-uicheck-output.txt。`;
+        ? 'Claude API 调用失败：鉴权异常。请检查 API 密钥配置。'
+        : `Claude API 调用失败（退出码 ${code}）。请查看服务端日志和 .claude/uicheck-runtime-debug-output.txt。`;
       res.write(`data: ${JSON.stringify({ type: 'error', content: errMsg })}\n\n`);
       res.end();
       return;
@@ -1518,13 +1518,13 @@ app.get('/api/analyze/:type', async (req, res) => {
           flowName: flow.flowName,
           flowFunction: flow.flowFunction,
           promptFilePath: step2PromptPath,
-          imageRefs: [tomfcliFileRef(analysisDevPath), tomfcliFileRef(analysisDesignPath)],
+          imageRefs: [toClaudeFileRef(analysisDevPath), toClaudeFileRef(analysisDesignPath)],
           referenceFiles: step2References
         });
         console.log('[uicheck step2] final prompt:\n' + step2AnalysisPrompt);
         console.log('[uicheck step2] prompt image refs:', JSON.stringify([
-          tomfcliFileRef(analysisDevPath),
-          tomfcliFileRef(analysisDesignPath)
+          toClaudeFileRef(analysisDevPath),
+          toClaudeFileRef(analysisDesignPath)
         ]));
         await appendUICheckRuntimeDebug({
           phase: 'step2-before-model',
@@ -1548,7 +1548,7 @@ app.get('/api/analyze/:type', async (req, res) => {
             analysisDesign: step2AnalysisDesignInfo
           },
           referenceFiles: step2References,
-          imageRefs: [tomfcliFileRef(analysisDevPath), tomfcliFileRef(analysisDesignPath)],
+          imageRefs: [toClaudeFileRef(analysisDevPath), toClaudeFileRef(analysisDesignPath)],
           prompt: step2AnalysisPrompt,
           parsedJson: designSpec
         });
@@ -1560,8 +1560,8 @@ app.get('/api/analyze/:type', async (req, res) => {
           '--output-format', 'stream-json',
           step2AnalysisPrompt
         ];
-        console.log('[uicheck step2] mfcli args:', JSON.stringify(step2Args));
-        const mfcli2 = spawn('mfcli', step2Args, {
+        console.log('[uicheck step2] claude args:', JSON.stringify(step2Args));
+        const claude2 = spawn('claude', step2Args, {
           cwd: PARENT_DIR,
           env: { ...process.env }
         });
@@ -1571,8 +1571,8 @@ app.get('/api/analyze/:type', async (req, res) => {
         const step2AnalysisTimer = setTimeout(() => {
           step2AnalysisTimedOut = true;
           console.log('[uicheck step2 analysis] timeout - killing process');
-          mfcli2.kill('SIGTERM');
-          setTimeout(() => { try { mfcli2.kill('SIGKILL'); } catch {} }, 3000);
+          claude2.kill('SIGTERM');
+          setTimeout(() => { try { claude2.kill('SIGKILL'); } catch {} }, 3000);
         }, STEP2_ANALYSIS_TIMEOUT_MS);
 
         let step2StartTime = Date.now();
@@ -1582,24 +1582,24 @@ app.get('/api/analyze/:type', async (req, res) => {
         }, 15000);
 
         let step2RawLines = '';
-        mfcli2.stdout.on('data', (chunk) => {
+        claude2.stdout.on('data', (chunk) => {
           step2RawLines += chunk.toString();
         });
-        mfcli2.stderr.on('data', (chunk) => {
+        claude2.stderr.on('data', (chunk) => {
           console.log('[uicheck step2 analysis stderr]', chunk.toString().slice(0, 200));
         });
 
-        mfcli2.on('close', async (code2) => {
+        claude2.on('close', async (code2) => {
           clearTimeout(step2AnalysisTimer);
           const rawOutput = step2RawLines;
           const analysisOutput = extractTextFromStreamJson(step2RawLines).trim();
-          fs.writeFileSync('/tmp/mfcli-uicheck-step2-analysis-raw.txt', rawOutput);
-          fs.writeFileSync('/tmp/mfcli-uicheck-step2-analysis.txt', analysisOutput);
+          fs.writeFileSync(UICHECK_RUNTIME_DEBUG_PATH.replace('.json', '-step2-raw.txt'), rawOutput);
+          fs.writeFileSync(UICHECK_RUNTIME_DEBUG_PATH.replace('.json', '-step2.txt'), analysisOutput);
           console.log('[uicheck step2 analysis] closed, code:', code2, 'output length:', analysisOutput.length);
 
           if (step2AnalysisTimedOut) {
             clearInterval(heartbeat);
-            res.write(`data: ${JSON.stringify({ type: 'error', content: '开发稿问题识别超时（8分钟），请查看 /tmp/mfcli-uicheck-step2-analysis.txt' })}\n\n`);
+            res.write(`data: ${JSON.stringify({ type: 'error', content: '开发稿问题识别超时（8分钟），请查看 .claude/uicheck-runtime-debug-step2.txt' })}\n\n`);
             res.end();
             return;
           }
@@ -1608,8 +1608,8 @@ app.get('/api/analyze/:type', async (req, res) => {
             clearInterval(heartbeat);
             const quotaErr2 = /quota|authenticate|403|token-plan/i.test(analysisOutput);
             const errMsg2 = quotaErr2
-              ? '开发稿对比失败：mfcli 额度或鉴权异常（403/token-plan）。请先恢复可用额度后重试。'
-              : `开发稿对比失败（退出码 ${code2}）。请查看服务端日志和 /tmp/mfcli-uicheck-step2-analysis.txt`;
+              ? '开发稿对比失败：Claude API 鉴权异常。请检查 API 密钥配置。'
+              : `开发稿对比失败（退出码 ${code2}）。请查看服务端日志和 .claude/uicheck-runtime-debug-step2.txt`;
             res.write(`data: ${JSON.stringify({ type: 'error', content: errMsg2 })}\n\n`);
             res.end();
             return;
@@ -1647,7 +1647,7 @@ app.get('/api/analyze/:type', async (req, res) => {
 
           if (!issueData) {
             clearInterval(heartbeat);
-            res.write(`data: ${JSON.stringify({ type: 'error', content: '开发稿问题识别完成，但未解析到有效 JSON。请查看 /tmp/mfcli-uicheck-step2-analysis.txt' })}\n\n`);
+            res.write(`data: ${JSON.stringify({ type: 'error', content: '开发稿问题识别完成，但未解析到有效 JSON。请查看 .claude/uicheck-runtime-debug-step2.txt' })}\n\n`);
             res.end();
             return;
           }
@@ -1686,9 +1686,10 @@ app.get('/api/analyze/:type', async (req, res) => {
           res.write(`data: ${JSON.stringify({ type: 'done', code: 0 })}\n\n`);
           res.end();
         });
-        mfcli2.on('error', (err) => {
+        claude2.on('error', (err) => {
           clearTimeout(step2AnalysisTimer);
           clearInterval(heartbeat);
+          console.log('[uicheck step2] error:', err.message);
           res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`);
           res.end();
         });
@@ -1696,7 +1697,7 @@ app.get('/api/analyze/:type', async (req, res) => {
       }
 
       console.log('[uicheck step 2] missing dev file or empty design spec');
-      res.write(`data: ${JSON.stringify({ type: 'error', content: '设计稿结构解析失败，请检查设计稿是否可读，或查看 /tmp/mfcli-uicheck-output.txt 排查 FlickCLI 输出。' })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'error', content: '设计稿结构解析失败，请检查设计稿是否可读，或查看 .claude/uicheck-runtime-debug-output.txt 排查 Claude API 输出。' })}\n\n`);
       res.end();
       return;
     }
@@ -1705,7 +1706,8 @@ app.get('/api/analyze/:type', async (req, res) => {
     res.end();
   });
 
-  mfcli.on('error', (err) => {
+  claude.on('error', (err) => {
+    console.log('[uicheck] error:', err.message);
     res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`);
     res.end();
   });

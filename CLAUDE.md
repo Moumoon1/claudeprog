@@ -4,12 +4,12 @@
 
 当用户说"启动设计师平台"、"打开走查"、"我要用UI走查"等意图时，按以下步骤操作：
 
-1. **检测依赖**：依次检查 `node`、`python3 -c "from PIL import Image"`、`mfcli` 是否可用
-2. **如果任何依赖缺失**：运行 `cd designer-platform && bash install.sh` 一键安装（全程无交互）
+1. **检测依赖**：依次检查 `node`、`python -c "from PIL import Image"`
+2. **如果任何依赖缺失**：运行 `cd designer-platform && npm install`
 3. **启动服务**：在 `designer-platform/` 目录下运行 `node server.js`
 4. **告知用户**：浏览器访问 http://localhost:3000
 
-如果用户说"安装依赖"、"初始化环境"等，直接运行 `cd designer-platform && bash install.sh`
+如果用户说"安装依赖"、"初始化环境"等，直接运行 `cd designer-platform && npm install`
 
 ### 页面地址
 
